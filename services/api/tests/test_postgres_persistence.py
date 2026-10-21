@@ -44,7 +44,7 @@ async def test_postgres_color_tags_round_trip():
             db.add(
                 CalendarBlockRow(
                     id=ident,
-                    title="College final — San Diego",
+                    title="Conference day",
                     all_day=True,
                     start_at=datetime(2026, 10, 27, 7, tzinfo=UTC),
                     end_at=datetime(2026, 10, 28, 7, tzinfo=UTC),

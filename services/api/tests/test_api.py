@@ -774,7 +774,7 @@ async def test_all_day_calendar_block_preserves_other_events_and_tasks(client):
         result = await client.post(
             "/api/calendar-blocks",
             json={
-                "title": "College final — San Diego",
+                "title": "Conference day",
                 "all_day_date": "2026-10-27",
             },
         )

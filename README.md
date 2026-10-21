@@ -264,6 +264,9 @@ rolling its own credential store.
 SQLite or Postgres. There's no schema-migration tooling, so back up before
 pulling a new version.
 
+**ChatGPT / MCP:** the optional [MCP bridge](services/mcp/) exposes tasks and
+schedules to authorized MCP clients. See the [setup guide](docs/chatgpt-mcp.md).
+
 ---
 
 ## Project layout
@@ -278,6 +281,7 @@ services/api/horolog/
   capture.py      natural language → validated intent
   analytics.py    derived metrics
   api.py          HTTP surface + SSE
+services/mcp/    optional Streamable HTTP bridge for MCP clients
 apps/web/app/     Next.js 15, App Router, Tailwind v4
 docs/             ARCHITECTURE.md
 docker-compose.yml, infra/Dockerfile.*   deployment
