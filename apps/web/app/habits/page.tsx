@@ -10,13 +10,17 @@ import {
   api,
   createIntent,
   formatDuration,
+  localDateKey,
+  subtaskProgress,
+  toggleBlockCompletion,
+  type Block,
   type EnergyLevel,
   type Intent,
   type IntentKind,
   type Plan,
   type Priority,
 } from "@/app/lib/api";
-import { Plus, Trash2, RotateCcw, AlertTriangle, Sparkles, Clock, Zap } from "lucide-react";
+import { Plus, Trash2, RotateCcw, AlertTriangle, Sparkles, Clock, Zap, CheckCircle, Circle } from "lucide-react";
 
 /** Focus needs a >=90m minimum sitting (see docs/ARCHITECTURE.md's model
  *  table: `kind=focus, weekly, >=90m chunks`), enforced with a floor rather
@@ -108,6 +112,15 @@ export default function Habits() {
       setError(caught instanceof Error ? caught.message : "Could not save that routine.");
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function toggleSession(block: Block) {
+    try {
+      await toggleBlockCompletion(block);
+      await load();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not update that session.");
     }
   }
 
@@ -317,6 +330,7 @@ export default function Habits() {
           <ul className="space-y-3">
             {habits.map((habit) => {
               const blocks = plan?.blocks.filter((b) => b.intent_id === habit.id) ?? [];
+              const todayBlock = blocks.find((b) => b.start.slice(0, 10) === localDateKey());
               const fixed = habit.min_chunk_minutes === habit.max_chunk_minutes;
               const cadence = fixed
                 ? `${Math.round(habit.minutes_per_period / habit.min_chunk_minutes)}× weekly · ${formatDuration(habit.min_chunk_minutes)} each`
@@ -338,8 +352,23 @@ export default function Habits() {
                     <div className="truncate text-[15px] font-semibold text-fg">{habit.title}</div>
                     <div className="tabular mt-1 text-[12.5px] font-medium text-fg-muted">
                       {cadence} · <span className="text-accent font-semibold">{blocks.length} placed</span>
+                      {todayBlock?.completed && <span className="text-accent font-semibold"> · Done today</span>}
+                      {subtaskProgress(habit, localDateKey()).total > 0 && (
+                        <span className="text-accent font-semibold"> · {subtaskProgress(habit, localDateKey()).done}/{subtaskProgress(habit, localDateKey()).total} goals today</span>
+                      )}
                     </div>
                   </div>
+                  {todayBlock && (
+                    <button
+                      type="button"
+                      onClick={() => toggleSession(todayBlock)}
+                      aria-label={`${todayBlock.completed ? "Mark not done" : "Mark done"}: ${habit.title} today`}
+                      aria-pressed={todayBlock.completed}
+                      className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-fg-subtle hover:bg-sunk hover:text-accent"
+                    >
+                      {todayBlock.completed ? <CheckCircle size={19} className="text-accent" /> : <Circle size={19} />}
+                    </button>
+                  )}
                   <button
                     type="button"
                     onClick={async () => {

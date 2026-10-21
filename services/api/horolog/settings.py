@@ -18,7 +18,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # with `services/api` as its working directory. Pydantic otherwise only looks
 # in that working directory, so OAuth client credentials in the documented
 # file were silently ignored.
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 ENV_FILES = (PROJECT_ROOT / ".env", Path(".env"))
 
 

@@ -73,9 +73,10 @@ services:
     build:
       context: .
       dockerfile: infra/Dockerfile.api
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       db: { condition: service_healthy }
-      ollama-pull: { condition: service_completed_successfully }
     environment:
       # Overridable so the SQLite fallback above (delete `db`, set this in
       # .env) actually works — it used to be hardcoded here, which made that
@@ -85,7 +86,9 @@ services:
       HOROLOG_LLM_BASE_URL: ${HOROLOG_LLM_BASE_URL:-http://ollama:11434/v1}
       HOROLOG_LLM_MODEL: ${HOROLOG_LLM_MODEL:-qwen3:8b}
       HOROLOG_LLM_API_KEY: ${HOROLOG_LLM_API_KEY:-}
-      HOROLOG_TIMEZONE: ${HOROLOG_TIMEZONE:-UTC}
+      HOROLOG_TIMEZONE: ${HOROLOG_TIMEZONE:-America/Los_Angeles}
+      HOROLOG_WORKDAY_START_MIN: ${HOROLOG_WORKDAY_START_MIN:-480}
+      HOROLOG_WORKDAY_END_MIN: ${HOROLOG_WORKDAY_END_MIN:-1200}
       HOROLOG_HORIZON_DAYS: ${HOROLOG_HORIZON_DAYS:-21}
       HOROLOG_CORS_ORIGINS: '["http://localhost:3000"]'
       # Where a provider's consent screen sends the browser back to — the
@@ -122,7 +125,7 @@ services:
     depends_on:
       api: { condition: service_healthy }
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3100:3000"
     restart: unless-stopped
 
 volumes:

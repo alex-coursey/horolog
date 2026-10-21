@@ -28,6 +28,8 @@ def solve(
     busy: list[BusyInterval],
     horizon_slots: int,
     previous: Plan | None = None,
+    start_weekday: int = 0,
+    not_before_slot: int = 0,
 ) -> Plan:
     """Place every intent's demand around `busy`, staying close to `previous`.
 
@@ -38,9 +40,11 @@ def solve(
         raise ValueError(f"horizon_slots must be positive, got {horizon_slots}")
 
     started = time.perf_counter()
-    requirements = expand_all(intents, horizon_slots)
+    requirements = expand_all(intents, horizon_slots, start_weekday)
     prior = previous.by_key() if previous else {}
-    placement = construct(requirements, merge_busy(busy), previous=prior)
+    placement = construct(
+        requirements, merge_busy(busy), previous=prior, not_before_slot=not_before_slot
+    )
 
     blocks: list[ScheduledBlock] = []
     unmet: list[UnmetDemand] = []

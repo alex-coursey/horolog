@@ -59,6 +59,27 @@ class BusyRow(Base):
     end_slot: Mapped[int] = mapped_column(Integer)
 
 
+class CreationRequestRow(Base):
+    """A caller's retry key identifies exactly one creation, even under concurrency."""
+
+    __tablename__ = "creation_requests"
+    id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    payload_hash: Mapped[str] = mapped_column(String(64))
+    resource_id: Mapped[str] = mapped_column(String(64))
+
+
+class CalendarBlockRow(Base):
+    """User-created fixed commitments, anchored to dates rather than horizon slots."""
+
+    __tablename__ = "calendar_blocks"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    title: Mapped[str] = mapped_column(String(200))
+    start_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    end_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    all_day: Mapped[bool] = mapped_column(default=False)
+
+
 class PlanRow(Base):
     __tablename__ = "plans"
 
@@ -144,6 +165,15 @@ async def init_db() -> None:
     try:
         async with _engine().begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+        # Legacy slot-only rows have no recoverable historical origin. Preserve
+        # their currently displayed dates once, rather than guessing a past date.
+        base = datetime.now(settings().zone).replace(hour=0, minute=0, second=0, microsecond=0)
+        async with _session_factory()() as db:
+            rows = (await db.execute(select(IntentRow))).scalars().all()
+            for row in rows:
+                if row.payload.get("slot_origin") is None:
+                    row.payload = row.payload | {"slot_origin": base.isoformat()}
+            await db.commit()
     except Exception as exc:
         raise RuntimeError(
             "Horolog could not set up the database at startup.\n\n"
@@ -163,14 +193,20 @@ async def session() -> AsyncIterator[AsyncSession]:
         yield db
 
 
-async def load_intents(db: AsyncSession) -> list[Intent]:
+async def load_intents(db: AsyncSession, base: datetime | None = None) -> list[Intent]:
     rows = (await db.execute(select(IntentRow))).scalars().all()
-    return [row.to_domain() for row in rows]
+    return [row.to_domain().for_origin(base) if base else row.to_domain() for row in rows]
 
 
 async def load_previous_plan(db: AsyncSession) -> Plan | None:
     row = await db.get(PlanRow, LATEST_PLAN_ID)
-    return Plan.model_validate(json.loads(row.payload)) if row else None
+    if row is None:
+        return None
+    saved = row.saved_at if row.saved_at.tzinfo else row.saved_at.replace(tzinfo=UTC)
+    if saved.astimezone(settings().zone).date() != datetime.now(settings().zone).date():
+        # Slots are relative to today's origin; yesterday's plan cannot be reused.
+        return None
+    return Plan.model_validate(json.loads(row.payload))
 
 
 async def save_plan(db: AsyncSession, plan: Plan) -> None:

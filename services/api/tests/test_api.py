@@ -6,7 +6,7 @@ import os
 import tempfile
 import typing
 from collections.abc import AsyncGenerator, AsyncIterator
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import cast
 
 import httpx
@@ -21,7 +21,7 @@ from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from horolog.api import app, origin
-from horolog.db import BusyRow, init_db, session
+from horolog.db import BusyRow, CalendarBlockRow, init_db, session
 
 
 @pytest_asyncio.fixture
@@ -44,6 +44,7 @@ async def client() -> AsyncIterator[AsyncClient]:
         gen = cast("AsyncGenerator[AsyncSession, None]", session())
         db = await anext(gen)
         await db.execute(delete(BusyRow))
+        await db.execute(delete(CalendarBlockRow))
         await db.commit()
         await gen.aclose()
         yield http
@@ -383,9 +384,7 @@ async def test_uncompleting_a_task_restores_it_to_the_plan(client: AsyncClient) 
 
 @pytest.mark.asyncio
 async def test_completing_a_recurring_habit_is_rejected(client: AsyncClient) -> None:
-    """Completion is scoped to one-shot tasks — a habit needs per-occurrence
-    state that does not exist yet, so it must fail loudly, not silently no-op
-    or complete the whole recurring series."""
+    """The whole recurring series cannot be completed by the one-shot route."""
     created = (
         await client.post(
             "/api/intents",
@@ -401,6 +400,45 @@ async def test_completing_a_recurring_habit_is_rejected(client: AsyncClient) -> 
     ).json()
     response = await client.post(f"/api/intents/{created['id']}/complete")
     assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_recurring_session_completion_survives_replanning_and_can_be_undone(
+    client: AsyncClient,
+) -> None:
+    created = (
+        await client.post(
+            "/api/intents",
+            json={
+                "title": "Read",
+                "kind": "habit",
+                "minutes_per_period": 60,
+                "period_days": 7,
+                "min_chunk_minutes": 60,
+                "max_chunk_minutes": 60,
+            },
+        )
+    ).json()
+    path = f"/api/intents/{created['id']}"
+    initial = (await client.get("/api/plan")).json()["blocks"]
+    mine = [block for block in initial if block["intent_id"] == created["id"]]
+    assert len(mine) >= 2
+    day = mine[0]["start"][:10]
+
+    marked = await client.put(f"{path}/completed-dates/{day}")
+    assert marked.status_code == 200
+    assert marked.json()["completed_dates"] == [day]
+    await client.post("/api/plan/solve")
+    after = (await client.get("/api/plan")).json()["blocks"]
+    assert all(block["completed"] == (block["start"][:10] == day)
+               for block in after if block["intent_id"] == created["id"])
+    assert (await client.get(path)).json()["completed_dates"] == [day]
+
+    undone = await client.delete(f"{path}/completed-dates/{day}")
+    assert undone.status_code == 200
+    assert undone.json()["completed_dates"] == []
+    assert not any(block["completed"] for block in (await client.get("/api/plan")).json()["blocks"]
+                   if block["intent_id"] == created["id"])
 
 
 @pytest.mark.asyncio
@@ -538,3 +576,605 @@ async def test_editing_an_intent_rejects_the_same_invalid_shapes_as_creating_one
         },
     )
     assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_patch_preserves_constraints_and_appearance_does_not_replan(client):
+    from unittest.mock import AsyncMock, patch
+
+    created = (
+        await client.post(
+            "/api/intents",
+            json={
+                "title": "Keep constraints",
+                "minutes_per_period": 60,
+                "due": (origin() + timedelta(days=4)).isoformat(),
+                "earliest": (origin() + timedelta(days=1)).isoformat(),
+                "allowed_weekdays": [0, 2, 4],
+                "tags": ["work"],
+            },
+        )
+    ).json()
+    path = f"/api/intents/{created['id']}"
+    before = (await client.get("/api/plan")).json()["blocks"]
+    with patch("horolog.api._replan", new_callable=AsyncMock) as replan:
+        result = await client.patch(path, json={"color": "#12aBcD", "add_tags": ["home"]})
+        replan.assert_not_awaited()
+    assert result.status_code == 200
+    saved = (await client.get(path)).json()
+    assert saved == created | {"color": "#12aBcD", "tags": ["work", "home"]}
+    plan = (await client.get("/api/plan")).json()
+    assert [(b["start"], b["end"]) for b in plan["blocks"]] == [
+        (b["start"], b["end"]) for b in before
+    ]
+    assert all(b["color"] == "#12aBcD" and b["tags"] == ["work", "home"] for b in plan["blocks"])
+    assert (await client.patch(path, json={"remove_tags": ["work"]})).json()["tags"] == ["home"]
+    assert (await client.patch(path, json={"tags": [], "color": None})).json()["color"] is None
+    assert (await client.get(path)).json()["tags"] == []
+
+
+@pytest.mark.asyncio
+async def test_patch_validates_complete_model_and_explicit_null(client):
+    created = (
+        await client.post(
+            "/api/intents",
+            json={
+                "title": "Validation",
+                "minutes_per_period": 60,
+            },
+        )
+    ).json()
+    path = f"/api/intents/{created['id']}"
+    for changes in [
+        {"max_chunk_minutes": 15},
+        {"minutes_per_period": 10},
+        {"allowed_weekdays": [7]},
+        {"allowed_weekdays": [1, 1]},
+        {"title": None},
+        {"tags": None},
+        {"color": "invalid"},
+        {"completed_at": "2026-01-01"},
+        {"tags": [" "]},
+        {"daily_windows": [{"start_min": 600, "end_min": 610}]},
+    ]:
+        assert (await client.patch(path, json=changes)).status_code == 422
+        assert (await client.get(path)).json() == created
+    assert (await client.patch("/api/intents/missing", json={})).status_code == 404
+    recurring = await client.patch(
+        path,
+        json={
+            "period_days": 7,
+            "kind": "habit",
+            "allowed_weekdays": [0, 6],
+            "minutes_per_period": 120,
+            "min_chunk_minutes": 60,
+            "max_chunk_minutes": 60,
+            "max_per_day": 1,
+        },
+    )
+    assert recurring.status_code == 200
+    assert (await client.post(path + "/complete")).status_code == 422
+    assert (
+        await client.patch(path, json={"period_days": None, "allowed_weekdays": None})
+    ).status_code == 200
+    completed = (await client.post(path + "/complete")).json()
+    assert (await client.patch(path, json={"title": "Done"})).json()["completed_at"] == completed[
+        "completed_at"
+    ]
+    assert (await client.patch(path, json={"period_days": 7})).status_code == 422
+    assert (await client.delete(path + "/complete")).json()["completed_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_patch_preserves_server_fields_and_multiple_windows(client):
+    from horolog.db import IntentRow
+
+    created = (
+        await client.post(
+            "/api/intents",
+            json={
+                "title": "Meeting",
+                "minutes_per_period": 60,
+            },
+        )
+    ).json()
+    path = f"/api/intents/{created['id']}"
+    gen = session()
+    db = await anext(gen)
+    row = await db.get(IntentRow, created["id"])
+    row.payload = row.payload | {
+        "zoom_meeting_id": "test-only",
+        "zoom_join_url": "https://example.test/meeting",
+        "daily_windows": [{"start_min": 540, "end_min": 660}, {"start_min": 840, "end_min": 960}],
+        "blocked_slots": [[36, 40]],
+    }
+    await db.commit()
+    await gen.aclose()
+    before = (await client.get(path)).json()
+    after = (await client.patch(path, json={"tags": ["meeting"]})).json()
+    assert after == before | {"tags": ["meeting"]}
+    after = (await client.patch(path, json={"window_start_min": 570})).json()
+    assert after["daily_windows"] == [
+        {"start_min": 570, "end_min": 660},
+        {"start_min": 840, "end_min": 960},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_patch_datetime_localisation_and_clearing_constraints(client):
+    from horolog.domain.time import to_slot
+    from horolog.settings import settings
+
+    created = (
+        await client.post(
+            "/api/intents",
+            json={
+                "title": "Dates",
+                "minutes_per_period": 60,
+            },
+        )
+    ).json()
+    path = f"/api/intents/{created['id']}"
+    local_due = (origin() + timedelta(days=3, hours=12)).replace(tzinfo=None)
+    result = await client.patch(path, json={"due": local_due.isoformat()})
+    assert result.status_code == 200
+    assert result.json()["due_slot"] == to_slot(local_due.replace(tzinfo=settings().zone), origin())
+    aware = (origin() + timedelta(days=1)).astimezone(UTC)
+    result = await client.patch(path, json={"earliest": aware.isoformat()})
+    assert result.json()["earliest_slot"] == to_slot(aware, origin())
+    assert (await client.patch(path, json={"due": aware.isoformat()})).status_code == 422
+    cleared = (
+        await client.patch(
+            path,
+            json={
+                "due": None,
+                "earliest": None,
+                "daily_windows": [],
+                "attendee_busy": [],
+            },
+        )
+    ).json()
+    assert cleared["due_slot"] is None and cleared["earliest_slot"] is None
+    assert cleared["daily_windows"] == [] and cleared["blocked_slots"] == []
+
+
+@pytest.mark.asyncio
+async def test_all_day_calendar_block_preserves_other_events_and_tasks(client):
+    from unittest.mock import patch
+
+    from horolog.settings import settings
+
+    base = datetime(2026, 10, 20, tzinfo=settings().zone)
+    with patch("horolog.api.origin", return_value=base):
+        await client.put(
+            "/api/busy",
+            json=[
+                {
+                    "label": "Existing commitment",
+                    "start": (base + timedelta(hours=10)).isoformat(),
+                    "end": (base + timedelta(hours=11)).isoformat(),
+                }
+            ],
+        )
+        task = (
+            await client.post(
+                "/api/intents",
+                json={
+                    "title": "College work",
+                    "minutes_per_period": 60,
+                    "period_days": 7,
+                    "allowed_weekdays": [1],
+                    "min_chunk_minutes": 60,
+                    "max_chunk_minutes": 60,
+                    "max_per_day": 1,
+                },
+            )
+        ).json()
+        baseline_unmet = (await client.get("/api/plan")).json()["unmet"]
+        result = await client.post(
+            "/api/calendar-blocks",
+            json={
+                "title": "College final — San Diego",
+                "all_day_date": "2026-10-27",
+            },
+        )
+        assert result.status_code == 201
+        block = result.json()
+        assert block["all_day"] is True
+        assert block["start"].startswith("2026-10-27T00:00:00")
+        assert block["end"].startswith("2026-10-28T00:00:00")
+        plan = block["plan"]
+        assert any(b["label"] == "Existing commitment" for b in plan["busy"])
+        fixed = [b for b in plan["busy"] if b["source"] == "calendar-block"]
+        assert len(fixed) == 1
+        assert datetime.fromisoformat(fixed[0]["start"]) == datetime.fromisoformat(block["start"])
+        assert all(not b["start"].startswith("2026-10-27") for b in plan["blocks"])
+        openings = (await client.get("/api/availability?days=14&minutes=60")).json()
+        assert all(not slot["start"].startswith("2026-10-27") for slot in openings)
+        assert any(
+            u["intent_id"] == task["id"] and u["shortfall_minutes"] == 60 for u in plan["unmet"]
+        )
+        assert (await client.get("/api/intents/" + task["id"])).json() == task
+        listed = (await client.get("/api/calendar-blocks")).json()
+        assert listed == [{k: v for k, v in block.items() if k != "plan"}]
+        # Batch replacement of manual busy events must not erase fixed date blocks.
+        await client.put("/api/busy", json=[])
+        assert len((await client.get("/api/calendar-blocks")).json()) == 1
+        assert (await client.delete("/api/calendar-blocks/" + block["id"])).status_code == 204
+        plan = (await client.get("/api/plan")).json()
+        assert plan["unmet"] == baseline_unmet
+        assert any(b["start"].startswith("2026-10-27") for b in plan["blocks"])
+
+
+@pytest.mark.asyncio
+async def test_calendar_blocks_keep_dates_across_midnight_and_dst(client):
+    from unittest.mock import patch
+
+    from horolog.settings import settings
+
+    base = datetime(2026, 10, 20, tzinfo=settings().zone)
+    with patch("horolog.api.origin", return_value=base):
+        block = (
+            await client.post(
+                "/api/calendar-blocks",
+                json={
+                    "title": "Away",
+                    "all_day_date": "2026-10-27",
+                    "end_date": "2026-10-29",
+                },
+            )
+        ).json()
+    with patch("horolog.api.origin", return_value=base + timedelta(days=1)):
+        plan = (await client.post("/api/plan/solve")).json()
+        fixed = [b for b in plan["busy"] if b["source"] == "calendar-block"]
+        assert fixed[0]["start"].startswith("2026-10-27T00:00:00")
+        assert fixed[0]["end"].startswith("2026-10-29T00:00:00")
+    await client.delete("/api/calendar-blocks/" + block["id"])
+    from zoneinfo import ZoneInfo
+
+    with (
+        patch(
+            "horolog.api.settings",
+            return_value=settings().model_copy(update={"timezone": "America/Los_Angeles"}),
+        ),
+        patch(
+            "horolog.api.origin",
+            return_value=datetime(2026, 10, 20, tzinfo=ZoneInfo("America/Los_Angeles")),
+        ),
+    ):
+        dst = (
+            await client.post(
+                "/api/calendar-blocks",
+                json={
+                    "title": "DST absence",
+                    "all_day_date": "2026-11-01",
+                },
+            )
+        ).json()
+        assert dst["start"] == "2026-11-01T00:00:00-07:00"
+        assert dst["end"] == "2026-11-02T00:00:00-08:00"
+        await client.delete("/api/calendar-blocks/" + dst["id"])
+
+
+@pytest.mark.asyncio
+async def test_timed_calendar_blocks_round_outwards_and_validate(client):
+    base = origin()
+    result = await client.post(
+        "/api/calendar-blocks",
+        json={
+            "title": "Appointment",
+            "start": (base + timedelta(hours=9, minutes=7)).astimezone(UTC).isoformat(),
+            "end": (base + timedelta(hours=9, minutes=22)).astimezone(UTC).isoformat(),
+        },
+    )
+    assert result.status_code == 201
+    block = result.json()
+    fixed = [b for b in block["plan"]["busy"] if b["source"] == "calendar-block"]
+    assert datetime.fromisoformat(fixed[0]["start"]) == base + timedelta(hours=9)
+    assert datetime.fromisoformat(fixed[0]["end"]) == base + timedelta(hours=9, minutes=30)
+    for body in [
+        {"title": "Missing dates"},
+        {"title": " ", "all_day_date": "2026-10-27"},
+        {"title": "Wrong order", "all_day_date": "2026-10-27", "end_date": "2026-10-26"},
+        {"title": "Mixed", "all_day_date": "2026-10-27", "start": base.isoformat()},
+        {"title": "Wrong date", "all_day_date": "2026-02-30"},
+        {"title": "Wrong order", "start": base.isoformat(), "end": base.isoformat()},
+    ]:
+        assert (await client.post("/api/calendar-blocks", json=body)).status_code == 422
+    assert len((await client.get("/api/calendar-blocks")).json()) == 1
+    assert (await client.delete("/api/calendar-blocks/missing")).status_code == 404
+    await client.delete("/api/calendar-blocks/" + block["id"])
+
+
+@pytest.mark.asyncio
+async def test_cached_plan_expires_after_local_midnight(client):
+    from horolog.db import PlanRow, load_previous_plan
+
+    gen = session()
+    db = await anext(gen)
+    row = await db.get(PlanRow, 1)
+    row.saved_at = datetime.now(UTC) - timedelta(days=1)
+    await db.commit()
+    assert await load_previous_plan(db) is None
+    await gen.aclose()
+    assert (await client.get("/api/plan")).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_creation_retry_keys_and_conflicting_input(client):
+    import asyncio
+    import uuid
+
+    for endpoint, body in [
+        ("/api/intents", {"title": "Retry task", "minutes_per_period": 60}),
+        ("/api/calendar-blocks", {"title": "Retry trip", "all_day_date": "2026-10-27"}),
+    ]:
+        headers = {"Idempotency-Key": uuid.uuid4().hex}
+        # Concurrent identical requests must serialize on the DB uniqueness constraint.
+        first, second = await asyncio.gather(
+            *[client.post(endpoint, json=body, headers=headers) for _ in range(2)]
+        )
+        assert first.status_code == second.status_code == 201
+        assert first.json()["id"] == second.json()["id"]
+        different = await client.post(endpoint, json=body | {"title": "Different"}, headers=headers)
+        assert different.status_code == 409
+        another = await client.post(endpoint, json=body)
+        assert another.status_code == 201 and another.json()["id"] != first.json()["id"]
+        await client.delete(endpoint + "/" + first.json()["id"])
+        assert (await client.post(endpoint, json=body, headers=headers)).status_code == 409
+        await client.delete(endpoint + "/" + another.json()["id"])
+
+
+@pytest.mark.asyncio
+async def test_weekly_edits_preserve_session_length_and_support_skip(client):
+    from unittest.mock import patch
+
+    base = origin()
+    weekdays = [base.weekday(), (base.weekday() + 2) % 7, (base.weekday() + 4) % 7]
+    task = (
+        await client.post(
+            "/api/intents",
+            json={
+                "title": "Study",
+                "kind": "habit",
+                "period_days": 7,
+                "minutes_per_period": 135,
+                "allowed_weekdays": weekdays,
+                "min_chunk_minutes": 45,
+                "max_chunk_minutes": 45,
+                "max_per_day": 1,
+            },
+        )
+    ).json()
+    path = "/api/intents/" + task["id"]
+    updated = (await client.patch(path, json={"allowed_weekdays": weekdays[1:]})).json()
+    assert updated["minutes_per_period"] == 90 and updated["min_chunk_minutes"] == 45
+    updated = (await client.patch(path, json={"session_minutes": 60})).json()
+    assert updated["minutes_per_period"] == 120 and updated["max_chunk_minutes"] == 60
+    assert (
+        await client.patch(path, json={"session_minutes": 60, "minutes_per_period": 180})
+    ).status_code == 422
+    skip_day = (base + timedelta(days=2)).date().isoformat()
+    result = await client.post(path + "/skips/" + skip_day)
+    assert result.status_code == 200
+    assert result.json()["task"]["skipped_dates"] == [skip_day]
+    assert (await client.post(path + "/skips/" + skip_day)).json()["task"]["skipped_dates"] == [
+        skip_day
+    ]
+    assert all(not b["start"].startswith(skip_day) for b in result.json()["plan"]["blocks"])
+    assert (await client.post(path + "/complete")).status_code == 422
+    assert (await client.patch(path, json={"period_days": None})).status_code == 422
+    assert (await client.delete(path + "/skips/" + skip_day)).json()["task"]["skipped_dates"] == []
+    assert (
+        await client.post(path + "/skips/" + (base + timedelta(days=1)).date().isoformat())
+    ).status_code == 422
+    budget = (
+        await client.post(
+            "/api/intents",
+            json={
+                "title": "Weekly goal",
+                "minutes_per_period": 120,
+                "period_days": 7,
+            },
+        )
+    ).json()
+    assert (
+        await client.post("/api/intents/" + budget["id"] + "/skips/" + skip_day)
+    ).status_code == 422
+    with patch("horolog.api._replan") as replan:
+        # Explicit total demand still wins when no session shorthand is used.
+        replan.return_value = None
+        result = await client.patch(
+            path, json={"allowed_weekdays": weekdays, "minutes_per_period": 180}
+        )
+        assert result.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_edit_fixed_appointments_preserves_ids_and_validates(client):
+    block = (
+        await client.post(
+            "/api/calendar-blocks",
+            json={
+                "title": "Trip",
+                "all_day_date": "2026-10-27",
+                "end_date": "2026-10-29",
+            },
+        )
+    ).json()
+    path = "/api/calendar-blocks/" + block["id"]
+    moved = (await client.patch(path, json={"all_day_date": "2026-10-28"})).json()
+    assert moved["id"] == block["id"] and moved["end"].startswith("2026-10-30")
+    renamed = (await client.patch(path, json={"title": "College trip"})).json()
+    assert renamed["start"] == moved["start"] and renamed["end"] == moved["end"]
+    assert (await client.patch(path, json={"end_date": "2026-10-27"})).status_code == 422
+    assert (await client.patch(path, json={"title": None})).status_code == 422
+    converted = await client.patch(
+        path,
+        json={
+            "start": "2026-10-28T10:00:00-07:00",
+            "end": "2026-10-28T11:00:00-07:00",
+        },
+    )
+    assert converted.status_code == 200 and not converted.json()["all_day"]
+    assert (await client.patch(path, json={"end": "2026-10-28T09:00:00-07:00"})).status_code == 422
+    back = (await client.patch(path, json={"all_day_date": "2026-10-29"})).json()
+    assert back["all_day"] and back["end"].startswith("2026-10-30")
+    await client.delete(path)
+
+
+@pytest.mark.asyncio
+async def test_dates_remain_fixed_after_rollover_and_appearance_edit(client):
+    from unittest.mock import patch
+
+    from horolog.domain.time import from_slot
+
+    base = origin()
+    due = base + timedelta(days=4, hours=12)
+    earliest = base + timedelta(days=1, hours=9)
+    task = (
+        await client.post(
+            "/api/intents",
+            json={
+                "title": "Stable dates",
+                "minutes_per_period": 60,
+                "due": due.isoformat(),
+                "earliest": earliest.isoformat(),
+                "attendee_busy": [
+                    {
+                        "start": (base + timedelta(days=2, hours=10)).isoformat(),
+                        "end": (base + timedelta(days=2, hours=11)).isoformat(),
+                    }
+                ],
+            },
+        )
+    ).json()
+    path = "/api/intents/" + task["id"]
+    tomorrow = base + timedelta(days=1)
+    with patch("horolog.api.origin", return_value=tomorrow):
+        updated = (await client.patch(path, json={"color": "#123456"})).json()
+        assert from_slot(updated["due_slot"], tomorrow) == due
+        assert from_slot(updated["earliest_slot"], tomorrow) == earliest
+        assert from_slot(updated["blocked_slots"][0][0], tomorrow) == base + timedelta(
+            days=2, hours=10
+        )
+    with patch("horolog.api.origin", return_value=tomorrow + timedelta(days=1)):
+        saved = (await client.get(path)).json()
+        assert from_slot(saved["due_slot"], tomorrow + timedelta(days=1)) == due
+    cleared = (await client.patch(path, json={"due": None, "earliest": None})).json()
+    assert cleared["due_slot"] is None and cleared["earliest_slot"] is None
+
+
+@pytest.mark.asyncio
+async def test_new_placements_are_in_future_and_idle_differs_from_bookable(client):
+    from unittest.mock import patch
+
+    now = origin() + timedelta(hours=10, minutes=7)
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz) if tz else now.replace(tzinfo=None)
+
+    with patch("horolog.api.datetime", Clock):
+        task = await client.post(
+            "/api/intents",
+            json={
+                "title": "Created at 10:07",
+                "minutes_per_period": 60,
+            },
+        )
+        assert task.status_code == 201
+        plan = (await client.get("/api/plan")).json()
+        assert plan["blocks"]
+        assert all(datetime.fromisoformat(b["start"]) >= now for b in plan["blocks"])
+        bookable = (await client.get("/api/availability?minutes=60&days=7")).json()
+        idle = (await client.get("/api/availability?minutes=60&days=7&mode=idle")).json()
+        assert len(bookable) > len(idle)
+        for slot in idle:
+            start, end = datetime.fromisoformat(slot["start"]), datetime.fromisoformat(slot["end"])
+            assert not any(
+                start < datetime.fromisoformat(b["end"])
+                and datetime.fromisoformat(b["start"]) < end
+                for b in plan["blocks"]
+            )
+        assert (await client.get("/api/availability?mode=unknown")).status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_late_placements_are_reported(client):
+    due = origin() - timedelta(days=1)
+    task = (
+        await client.post(
+            "/api/intents",
+            json={
+                "title": "Overdue work",
+                "minutes_per_period": 60,
+                "due": due.isoformat(),
+            },
+        )
+    ).json()
+    blocks = [
+        b for b in (await client.get("/api/plan")).json()["blocks"] if b["intent_id"] == task["id"]
+    ]
+    assert blocks and all(b["late_by_minutes"] > 0 for b in blocks)
+    assert all(datetime.fromisoformat(b["deadline"]) == due for b in blocks)
+
+
+@pytest.mark.asyncio
+async def test_legacy_slot_dates_are_anchored_once_without_reset(client):
+    from horolog.db import IntentRow
+
+    task = (
+        await client.post(
+            "/api/intents",
+            json={
+                "title": "Legacy date",
+                "minutes_per_period": 60,
+                "due": (origin() + timedelta(days=3)).isoformat(),
+            },
+        )
+    ).json()
+    gen = session()
+    db = await anext(gen)
+    row = await db.get(IntentRow, task["id"])
+    legacy = dict(row.payload)
+    legacy.pop("slot_origin")
+    row.payload = legacy
+    await db.commit()
+    await gen.aclose()
+    await init_db()
+    saved = (await client.get("/api/intents/" + task["id"])).json()
+    assert saved["slot_origin"] is not None
+    assert saved["due_slot"] == task["due_slot"]
+    await init_db()
+    assert (await client.get("/api/intents/" + task["id"])).json() == saved
+
+
+@pytest.mark.asyncio
+async def test_partial_slot_bounds_never_schedule_before_earliest_or_inside_attendee_busy(client):
+    from horolog.domain.time import to_slot
+
+    base = origin()
+    earliest = base + timedelta(days=1, hours=9, minutes=7)
+    body = {
+        "title": "Precise bounds",
+        "minutes_per_period": 30,
+        "earliest": earliest.isoformat(),
+        "attendee_busy": [
+            {
+                "start": (base + timedelta(days=1, hours=10, minutes=7)).isoformat(),
+                "end": (base + timedelta(days=1, hours=10, minutes=22)).isoformat(),
+            }
+        ],
+    }
+    task = (await client.post("/api/intents", json=body)).json()
+    assert task["earliest_slot"] == to_slot(earliest, base) + 1
+    assert task["blocked_slots"][0][1] == 96 + 42
+    bad = body | {"attendee_busy": [{"start": earliest.isoformat(), "end": earliest.isoformat()}]}
+    assert (await client.post("/api/intents", json=bad)).status_code == 422
+    assert (
+        await client.patch(
+            "/api/intents/" + task["id"], json={"attendee_busy": bad["attendee_busy"]}
+        )
+    ).status_code == 422

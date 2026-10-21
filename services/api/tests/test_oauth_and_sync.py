@@ -1165,15 +1165,20 @@ async def test_calendar_push_moves_only_the_block_that_actually_shifted(
     # A real meeting lands directly on "Mover"'s only legal window, so a
     # re-solve has to relocate it while "Anchor" — untouched — stays put.
     plan_before = await client.get("/api/plan")
-    origin_iso = plan_before.json()["origin"]
-    base = datetime.fromisoformat(origin_iso)
+    base = datetime.fromisoformat(
+        next(
+            block["start"]
+            for block in plan_before.json()["blocks"]
+            if block["intent_id"] == b["id"]
+        )
+    )
     await client.put(
         "/api/busy",
         json=[
             {
                 "label": "Surprise meeting",
-                "start": (base + timedelta(hours=10)).isoformat(),
-                "end": (base + timedelta(hours=11)).isoformat(),
+                "start": base.isoformat(),
+                "end": (base + timedelta(hours=1)).isoformat(),
             }
         ],
     )

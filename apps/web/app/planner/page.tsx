@@ -4,9 +4,10 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { Glyph, KIND_LABEL } from "@/app/components/Glyph";
 import { PRIORITY_LABEL, RULE } from "@/app/components/Grid";
 import { Shell } from "@/app/components/Shell";
-import { api, formatDuration, minutesBetween, type Plan, type Block, type Busy } from "@/app/lib/api";
+import { api, formatDuration, localDateKey, minutesBetween, subtaskProgress, toggleBlockCompletion, unmetCalendarConflict, type Plan, type Block, type Busy, type Intent } from "@/app/lib/api";
 import { EventManager, type Event } from "@/components/ui/event-manager";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import {
   Download,
   AlertTriangle,
@@ -15,13 +16,7 @@ import {
   Link2,
 } from "lucide-react";
 
-/** Map backend priority number to EventManager color-filter values.
- *  Rendering itself no longer reads these — `EventCard`/`ListView` in
- *  `event-manager.tsx` read `Event.priority` directly and paint it with
- *  `PRIORITY_TINT`/`RULE`/`FILL`, the same accent system every other view
- *  uses. `color` only still drives the toolbar's "filter by color" chips
- *  and the manual create-event dialog's swatch picker, so it still needs a
- *  distinct, named value per priority. */
+/** Priority accents remain the default when an intent has no custom color. */
 const PRIORITY_COLOR: Record<number, string> = {
   1: "p1",
   2: "p2",
@@ -50,15 +45,21 @@ function kindToCategory(kind: string): string {
 }
 
 /** Convert backend Block[] to EventManager Event[] */
-function blocksToEvents(blocks: Block[]): Event[] {
+function blocksToEvents(blocks: Block[], intents: Intent[]): Event[] {
   return blocks.map((block) => {
-    const tags: string[] = [PRIORITY_LABEL[block.priority]];
+    const tags: string[] = [...(block.tags ?? [])];
+    const intent = intents.find((item) => item.id === block.intent_id);
+    const goals = intent ? subtaskProgress(intent, block.start.slice(0, 10)) : null;
+    if (goals && goals.total > 0) tags.push(`${goals.done}/${goals.total} goals`);
+    tags.push(PRIORITY_LABEL[block.priority]);
+    if ((block.late_by_minutes ?? 0) > 0) tags.push("Late");
     if (block.moved_from !== null && block.moved_from !== block.start) {
       tags.push("Moved");
     }
     if (block.energy) {
       tags.push(block.energy.charAt(0).toUpperCase() + block.energy.slice(1) + " Energy");
     }
+    if (block.completed) tags.push("Done");
     return {
       // Multiple chunks of the same occurrence (a long focus session split
       // into two sittings, say) share intent_id + occurrence — chunk has to
@@ -66,14 +67,16 @@ function blocksToEvents(blocks: Block[]): Event[] {
       // (which lists several events per day cell) renders it visibly.
       id: `${block.intent_id}-${block.occurrence}-${block.chunk}`,
       title: block.title,
-      description: `${KIND_LABEL[block.kind]} · Chunk ${block.chunk} · ${formatDuration(minutesBetween(block.start, block.end))}`,
+      description: `${KIND_LABEL[block.kind]} · Chunk ${block.chunk} · ${formatDuration(minutesBetween(block.start, block.end))}${goals && goals.total > 0 ? ` · ${goals.done}/${goals.total} goals done` : ""}`,
       startTime: new Date(block.start),
       endTime: new Date(block.end),
-      color: PRIORITY_COLOR[block.priority] || "p3",
+      color: block.color || PRIORITY_COLOR[block.priority] || "p3",
       category: kindToCategory(block.kind),
       priority: block.priority,
       kind: block.kind,
       tags,
+      completed: block.completed,
+      completable: block.completed || block.start.slice(0, 10) <= localDateKey(),
     };
   });
 }
@@ -95,12 +98,16 @@ function busyToEvents(busy: Busy[]): Event[] {
 }
 
 export default function Planner() {
+  const router = useRouter();
   const [plan, setPlan] = useState<Plan | null>(null);
+  const [intents, setIntents] = useState<Intent[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
-      setPlan(await api.plan());
+      const [nextPlan, nextIntents] = await Promise.all([api.plan(), api.intents()]);
+      setPlan(nextPlan);
+      setIntents(nextIntents);
       setError(null);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Could not reach the scheduler.");
@@ -122,8 +129,8 @@ export default function Planner() {
   );
 
   const calendarEvents = useMemo(
-    () => [...blocksToEvents(plan?.blocks ?? []), ...busyToEvents(plan?.busy ?? [])],
-    [plan],
+    () => [...blocksToEvents(plan?.blocks ?? [], intents), ...busyToEvents(plan?.busy ?? [])],
+    [plan, intents],
   );
 
   const handleEventCreate = useCallback(
@@ -161,6 +168,26 @@ export default function Planner() {
     },
     [load],
   );
+
+  const handleEventToggleComplete = useCallback(async (id: string) => {
+    const block = plan?.blocks.find((b) => `${b.intent_id}-${b.occurrence}-${b.chunk}` === id);
+    if (!block) return;
+    try {
+      await toggleBlockCompletion(block);
+      await load();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not update completion.");
+    }
+  }, [plan, load]);
+
+  const handleSkipSession = useCallback(async (intentId: string, day: string) => {
+    try {
+      await api.skipSession(intentId, day);
+      await load();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not skip that session.");
+    }
+  }, [load]);
 
   return (
     <Shell onPlanChange={load}>
@@ -242,10 +269,15 @@ export default function Planner() {
           <section aria-label="Calendar view">
             <EventManager
               events={calendarEvents}
+              onDayClick={(day) => {
+                const date = [day.getFullYear(), String(day.getMonth() + 1).padStart(2, "0"), String(day.getDate()).padStart(2, "0")].join("-");
+                router.push(`/time?date=${date}`);
+              }}
               onEventCreate={handleEventCreate}
               onEventDelete={handleEventDelete}
+              onEventToggleComplete={handleEventToggleComplete}
               categories={["Task", "Habit", "Focus", "Buffer", "Meeting", "External"]}
-              availableTags={["Critical", "High", "Normal", "Low", "Moved", "Locked", "High Energy", "Medium Energy", "Low Energy"]}
+              availableTags={Array.from(new Set(calendarEvents.flatMap((event) => event.tags ?? [])))}
               colors={COLORS}
               defaultView="month"
               className="min-h-[600px]"
@@ -267,8 +299,10 @@ export default function Planner() {
             {plan && !plan.complete && (
               <Panel title="Unmet Demand">
                 <ul className="space-y-3">
-                  {plan.unmet.map((item) => (
-                    <li key={`${item.intent_id}-${item.title}`} className="flex gap-2.5">
+                  {plan.unmet.map((item) => {
+                    const intent = intents.find((candidate) => candidate.id === item.intent_id);
+                    const conflict = intent ? unmetCalendarConflict(plan, intent, item) : null;
+                    return <li key={`${item.intent_id}-${item.occurrence}`} className="flex gap-2.5">
                       <span
                         className="mt-1.5 h-2 w-2 shrink-0 rounded-full"
                         style={{ background: RULE[item.priority] }}
@@ -279,13 +313,18 @@ export default function Planner() {
                         <span className="tabular text-[11.5px] text-danger font-medium">
                           {formatDuration(item.shortfall_minutes)} short · {PRIORITY_LABEL[item.priority]}
                         </span>
+                        <p className="mt-1 text-[11.5px] leading-relaxed text-fg-muted">
+                          {conflict
+                            ? `${conflict.label} blocks ${new Date(`${conflict.day}T12:00:00`).toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" })}.`
+                            : "No space within the allowed days and hours."}
+                        </p>
+                        {conflict && conflict.day >= localDateKey() && (
+                          <button type="button" onClick={() => void handleSkipSession(item.intent_id, conflict.day)} className="mt-1 text-[11.5px] font-semibold text-accent underline underline-offset-2">Skip this session</button>
+                        )}
                       </div>
-                    </li>
-                  ))}
+                    </li>;
+                  })}
                 </ul>
-                <p className="mt-3.5 border-t border-black/[0.06] pt-3 text-[12px] text-fg-muted">
-                  Widen daily windows or lower priority to fit remaining demand.
-                </p>
               </Panel>
             )}
 

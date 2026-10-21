@@ -9,12 +9,13 @@ factory, never a new solver path.
 
 from __future__ import annotations
 
-from datetime import datetime
+import re
+from datetime import date, datetime
 from enum import IntEnum, StrEnum
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
-from horolog.domain.time import SLOT_MINUTES, minutes_to_slots
+from horolog.domain.time import SLOT_MINUTES, from_slot, minutes_to_slots, to_slot
 
 
 class Priority(IntEnum):
@@ -64,18 +65,73 @@ class DailyWindow(BaseModel):
         return self
 
 
+class Subtask(BaseModel):
+    id: str
+    title: str = Field(min_length=1, max_length=200)
+    for_date: date | None = None
+    completed_at: datetime | None = None
+    completed_dates: list[date] = Field(default_factory=list)
+
+
 class Intent(BaseModel):
     """A demand for time that the solver must satisfy."""
 
     id: str
     kind: IntentKind
     title: str
+    color: str | None = Field(default=None, max_length=32)
+    tags: list[str] = Field(default_factory=list)
+    subtasks: list[Subtask] = Field(default_factory=list)
     priority: Priority = Priority.P3
     energy: EnergyLevel | None = None
 
     # How much time, over what repeating period.
     minutes_per_period: int = Field(gt=0)
     period_days: int | None = Field(default=None, gt=0)
+    allowed_weekdays: list[int] | None = Field(default=None, min_length=1)
+
+    @field_validator("color")
+    @classmethod
+    def validate_color(cls, value: str | None) -> str | None:
+        if value is not None and not (
+            value
+            in {
+                "p1",
+                "p2",
+                "p3",
+                "p4",
+                "slate",
+                "blue",
+                "green",
+                "red",
+                "yellow",
+                "purple",
+                "pink",
+                "orange",
+            }
+            or re.fullmatch(r"#[0-9a-fA-F]{6}", value)
+        ):
+            raise ValueError("color must be a supported palette name or #RRGGBB")
+        return value
+
+    @field_validator("tags")
+    @classmethod
+    def validate_tags(cls, value: list[str]) -> list[str]:
+        if any(not tag.strip() for tag in value):
+            raise ValueError("tags must be nonempty strings")
+        return list(dict.fromkeys(value))
+
+    @field_validator("allowed_weekdays")
+    @classmethod
+    def validate_allowed_weekdays(cls, value: list[int] | None) -> list[int] | None:
+        if value is None:
+            return None
+        if any(day < 0 or day > 6 for day in value):
+            raise ValueError("Weekdays must be between 0 (Monday) and 6 (Sunday)")
+        if len(value) != len(set(value)):
+            raise ValueError("Duplicate weekdays are not allowed")
+        return value
+
     """None = a one-shot demand (a task). 7 = "per week" (a habit, focus goal)."""
 
     # Chunking. Equal min/max means non-interruptible.
@@ -87,6 +143,9 @@ class Intent(BaseModel):
     daily_windows: list[DailyWindow] = Field(default_factory=list)
 
     # Absolute bounds, as slots from the horizon origin.
+    slot_origin: datetime | None = None
+    skipped_dates: list[date] = Field(default_factory=list)
+    skipped_days: list[int] = Field(default_factory=list, exclude=True)
     earliest_slot: int | None = None
     due_slot: int | None = None
 
@@ -117,11 +176,11 @@ class Intent(BaseModel):
     completed intent entirely, so its capacity is freed on the very next
     solve — the row itself is kept rather than deleted, so the inbox and
     analytics can still show it was done. Scoped to one-shot tasks
-    (`period_days is None`) at the API layer (`api.py`'s complete/uncomplete
-    routes) — checking off one occurrence of a recurring habit needs
-    per-occurrence state, a real feature and not this one.
-    ponytail: upgrade path is per-occurrence completion for habits, when
-    someone actually asks for habit streaks."""
+    (`period_days is None`) at the API layer.
+    """
+    completed_dates: list[date] = Field(default_factory=list)
+    """Local dates on which a recurring session was checked off. Kept on the
+    intent so completion survives a new plan and a rolling horizon."""
 
     @model_validator(mode="after")
     def _coherent(self) -> Intent:
@@ -152,6 +211,35 @@ class Intent(BaseModel):
                     f"than min_chunk {self.min_chunk_minutes}; nothing could fit in it"
                 )
         return self
+
+    @property
+    def fixed_weekly_sessions(self) -> bool:
+        return (
+            self.period_days == 7
+            and self.allowed_weekdays is not None
+            and self.min_chunk_minutes == self.max_chunk_minutes
+            and self.max_per_day == 1
+            and self.minutes_per_period == self.min_chunk_minutes * len(self.allowed_weekdays)
+        )
+
+    def for_origin(self, base: datetime) -> Intent:
+        """Rebase persisted bounds at the boundary, leaving the solver calendar-free."""
+        anchor = self.slot_origin or base
+        if anchor.tzinfo is None:
+            raise ValueError("slot_origin must be timezone-aware")
+        anchor = anchor.astimezone(base.tzinfo)
+        values = self.model_dump()
+        for field in ("earliest_slot", "due_slot"):
+            slot = getattr(self, field)
+            if slot is not None:
+                values[field] = to_slot(from_slot(slot, anchor), base)
+        values["blocked_slots"] = [
+            (to_slot(from_slot(start, anchor), base), to_slot(from_slot(end, anchor), base))
+            for start, end in self.blocked_slots
+        ]
+        values["slot_origin"] = base
+        values["skipped_days"] = [(day - base.date()).days for day in self.skipped_dates]
+        return Intent.model_validate(values)
 
     @property
     def required_slots(self) -> int:

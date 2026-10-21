@@ -134,6 +134,7 @@ def construct(
     requirements: list[Requirement],
     busy: list[BusyInterval],
     previous: dict[tuple[str, int, int], ScheduledBlock] | None = None,
+    not_before_slot: int = 0,
 ) -> Placement:
     """Build a feasible placement for as much demand as fits.
 
@@ -169,6 +170,8 @@ def construct(
             if prior is None:
                 continue
             start = prior.start_slot
+            if start < not_before_slot and size != prior.slots:
+                continue
             window = next((w for w in req.windows if w.lo <= start and start + size <= w.hi), None)
             # A previous slot is only reclaimable if it is still inside a legal
             # window (the intent may have been edited), still free (a meeting
@@ -204,7 +207,9 @@ def construct(
                 window = req.windows[wi]
                 if req.max_per_day is not None and counts.get(window.day, 0) >= req.max_per_day:
                     continue
-                start_opt = occupancy.first_fit(window.lo, window.hi, size, req.blocked)
+                start_opt = occupancy.first_fit(
+                    max(window.lo, not_before_slot), window.hi, size, req.blocked
+                )
                 if start_opt is None:
                     continue
                 occupancy.take(start_opt, size)

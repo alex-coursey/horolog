@@ -74,7 +74,7 @@ class Requirement(BaseModel):
         return sum(w.span for w in self.windows)
 
 
-def _windows_for(intent: Intent, lo: int, hi: int) -> list[AllowedWindow]:
+def _windows_for(intent: Intent, lo: int, hi: int, start_weekday: int = 0) -> list[AllowedWindow]:
     """Absolute windows for [lo, hi), one per (day x daily_window), clipped."""
     if hi <= lo:
         return []
@@ -87,6 +87,13 @@ def _windows_for(intent: Intent, lo: int, hi: int) -> list[AllowedWindow]:
         else [(0, SLOTS_PER_DAY)]
     )
     for day in range(first_day, last_day + 1):
+        if (
+            intent.allowed_weekdays is not None
+            and (start_weekday + day) % 7 not in intent.allowed_weekdays
+        ):
+            continue
+        if day in intent.skipped_days:
+            continue
         base = day_start(day)
         for start_off, end_off in spans:
             w_lo, w_hi = max(base + start_off, lo), min(base + end_off, hi)
@@ -97,7 +104,7 @@ def _windows_for(intent: Intent, lo: int, hi: int) -> list[AllowedWindow]:
     return windows
 
 
-def expand(intent: Intent, horizon_slots: int) -> list[Requirement]:
+def expand(intent: Intent, horizon_slots: int, start_weekday: int = 0) -> list[Requirement]:
     """Expand one intent into its per-period requirements over the horizon."""
     lo = max(0, intent.earliest_slot or 0)
     # Deliberately NOT clipped to due_slot. Clipping would make late placement
@@ -116,8 +123,20 @@ def expand(intent: Intent, horizon_slots: int) -> list[Requirement]:
 
     def build(occurrence: int, p_lo: int, p_hi: int) -> Requirement | None:
         reach = min(p_hi, p_lo + SCHEDULING_RANGE_DAYS * SLOTS_PER_DAY)
-        windows = _windows_for(intent, p_lo, reach)
-        if not windows:
+        windows = _windows_for(intent, p_lo, reach, start_weekday)
+        skipped = (
+            sum(
+                1
+                for day in set(intent.skipped_days)
+                if p_lo <= day * SLOTS_PER_DAY < p_hi
+                and intent.allowed_weekdays is not None
+                and (start_weekday + day) % 7 in intent.allowed_weekdays
+            )
+            if intent.fixed_weekly_sessions
+            else 0
+        )
+        required = max(0, intent.required_slots - skipped * intent.min_chunk_slots)
+        if required == 0:
             return None
         return Requirement(
             intent_id=intent.id,
@@ -125,7 +144,7 @@ def expand(intent: Intent, horizon_slots: int) -> list[Requirement]:
             occurrence=occurrence,
             priority=intent.priority,
             energy=intent.energy,
-            required_slots=intent.required_slots,
+            required_slots=required,
             min_chunk=intent.min_chunk_slots,
             max_chunk=intent.max_chunk_slots,
             max_per_day=intent.max_per_day,
@@ -153,7 +172,9 @@ def expand(intent: Intent, horizon_slots: int) -> list[Requirement]:
     return out
 
 
-def expand_all(intents: list[Intent], horizon_slots: int) -> list[Requirement]:
+def expand_all(
+    intents: list[Intent], horizon_slots: int, start_weekday: int = 0
+) -> list[Requirement]:
     # A completed intent demands nothing further — skipped here, the one
     # choke point every intent's demand already passes through, rather than
     # in each of the (several) callers that build a requirement list.
@@ -161,5 +182,5 @@ def expand_all(intents: list[Intent], horizon_slots: int) -> list[Requirement]:
         r
         for intent in intents
         if intent.completed_at is None
-        for r in expand(intent, horizon_slots)
+        for r in expand(intent, horizon_slots, start_weekday)
     ]

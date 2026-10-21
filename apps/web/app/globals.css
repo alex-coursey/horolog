@@ -27,6 +27,20 @@
   --color-accent: #292524;       /* Stone 800 - monochrome neutral */
   --color-accent-hover: #44403c; /* Stone 700 */
   --color-on-accent: #ffffff;
+  --color-accent-foreground: var(--color-on-accent);
+
+  /* Tailwind utilities used by the shared UI controls need --color-* names. */
+  --color-background: var(--color-bg);
+  --color-foreground: var(--color-fg);
+  --color-border: var(--color-line);
+  --color-ring: var(--color-accent);
+  --color-card: var(--color-surface);
+  --color-card-foreground: var(--color-fg);
+  --color-popover: var(--color-surface);
+  --color-popover-foreground: var(--color-fg);
+  --color-input: var(--color-surface);
+  --color-destructive: var(--color-danger);
+  --color-destructive-foreground: #ffffff;
 
   --color-secondary: #f5f5f4;
   --color-secondary-foreground: #1c1917;
@@ -51,7 +65,8 @@
   --color-ok: #10b981;           /* Emerald 500 */
 
   /* Typography */
-  --font-serif: var(--font-bodoni-moda), ui-serif, Georgia, serif;
+  /* Keep legacy font-serif classes readable in headings and planner popovers. */
+  --font-serif: var(--font-jost), ui-sans-serif, system-ui, sans-serif;
   --font-sans: var(--font-jost), ui-sans-serif, system-ui, sans-serif;
   --font-mono: var(--font-jetbrains-mono), ui-monospace, "SF Mono", monospace;
 

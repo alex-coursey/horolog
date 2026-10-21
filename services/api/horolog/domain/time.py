@@ -30,12 +30,14 @@ def slots_to_minutes(slots: int) -> int:
     return slots * SLOT_MINUTES
 
 
-def to_slot(moment: datetime, origin: datetime) -> int:
-    """Floor `moment` to the slot index containing it."""
+def to_slot(moment: datetime, origin: datetime, *, round_up: bool = False) -> int:
+    """Convert in local wall time; round starts/busy ends up when requested."""
     if moment.tzinfo is None or origin.tzinfo is None:
         raise ValueError("datetimes must be timezone-aware")
-    delta = moment - origin
-    return int(delta.total_seconds() // (SLOT_MINUTES * 60))
+    delta = moment.astimezone(origin.tzinfo) - origin
+    seconds = delta.total_seconds()
+    width = SLOT_MINUTES * 60
+    return int(-(-seconds // width)) if round_up else int(seconds // width)
 
 
 def from_slot(slot: int, origin: datetime) -> datetime:

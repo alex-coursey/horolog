@@ -356,3 +356,90 @@ def test_a_busy_week_does_not_cascade() -> None:
         f"{moved} blocks moved but only {displaced} were displaced — "
         "the re-solve is cascading across untouched work"
     )
+
+
+def test_weekday_numbering_and_unmet_without_windows():
+    intent = task(minutes=60).model_copy(update={"allowed_weekdays": [0, 6]})
+    plan = solve([intent], [], WEEK, start_weekday=6)
+    assert plan.complete
+    assert all((6 + b.start_slot // SLOTS_PER_DAY) % 7 in [0, 6] for b in plan.blocks)
+    assert plan.blocks == solve([intent], [], WEEK, start_weekday=6).blocks
+    impossible = intent.model_copy(update={"allowed_weekdays": [1]})
+    plan = solve([impossible], [], SLOTS_PER_DAY, start_weekday=0)
+    assert not plan.complete
+    assert plan.unmet[0].shortfall_slots == 4
+    recurring = impossible.model_copy(update={"period_days": 1})
+    plan = solve([recurring], [], 2 * SLOTS_PER_DAY, start_weekday=3)
+    assert len(plan.unmet) == 2
+
+
+def test_future_cutoff_does_not_shift_recurrence_periods():
+    habit = task(minutes=60).model_copy(
+        update={
+            "period_days": 7,
+            "allowed_weekdays": [0],
+        }
+    )
+    plan = solve([habit], [], WEEK * 2, not_before_slot=SLOTS_PER_DAY, start_weekday=0)
+    assert len(plan.unmet) == 1 and plan.unmet[0].occurrence == 0
+    assert all(b.start_slot >= WEEK for b in plan.blocks)
+
+
+def test_skip_reduces_only_target_week_and_reports_no_false_shortfall():
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    base = datetime(2026, 10, 19, tzinfo=ZoneInfo("America/Los_Angeles"))
+    habit = (
+        task(minutes=90)
+        .model_copy(
+            update={
+                "period_days": 7,
+                "allowed_weekdays": [0, 2, 4],
+                "min_chunk_minutes": 30,
+                "max_chunk_minutes": 30,
+                "max_per_day": 1,
+                "skipped_dates": [(base + timedelta(days=2)).date()],
+                "slot_origin": base,
+            }
+        )
+        .for_origin(base)
+    )
+    plan = solve([habit], [], WEEK * 2, start_weekday=0)
+    assert plan.complete
+    assert sum(b.slots for b in plan.blocks if b.occurrence == 0) == 4
+    assert sum(b.slots for b in plan.blocks if b.occurrence == 1) == 6
+    assert not any(b.start_slot // SLOTS_PER_DAY == 2 for b in plan.blocks)
+    daily = habit.model_copy(
+        update={
+            "allowed_weekdays": [0],
+            "minutes_per_period": 30,
+            "skipped_dates": [base.date()],
+        }
+    ).for_origin(base)
+    plan = solve([daily], [], WEEK, start_weekday=0)
+    assert plan.complete and not plan.blocks
+
+
+def test_slot_conversion_handles_offset_datetimes_across_dst():
+    from datetime import UTC, datetime
+    from zoneinfo import ZoneInfo
+
+    from horolog.domain.time import to_slot
+
+    base = datetime(2026, 10, 31, tzinfo=ZoneInfo("America/Los_Angeles"))
+    # Nov 2 local midnight is 48 calendar hours later despite the clock change.
+    moment = datetime(2026, 11, 2, 8, tzinfo=UTC)
+    assert to_slot(moment, base) == 2 * SLOTS_PER_DAY
+
+
+def test_future_cutoff_preserves_started_blocks_but_not_resized_history():
+    original = task(minutes=60)
+    plan = solve([original], [], WEEK)
+    start = plan.blocks[0].start_slot
+    cutoff = start + 1
+    kept = solve([original], [], WEEK, previous=plan, not_before_slot=cutoff)
+    assert kept.blocks[0].start_slot == start
+    resized = original.model_copy(update={"minutes_per_period": 90})
+    changed = solve([resized], [], WEEK, previous=plan, not_before_slot=cutoff)
+    assert all(b.start_slot >= cutoff for b in changed.blocks)

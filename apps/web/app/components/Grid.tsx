@@ -1,13 +1,13 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Glyph, KIND_LABEL } from "@/app/components/Glyph";
-import type { Block, Busy, Priority } from "@/app/lib/api";
-import { PRIORITY_NAME, PRIORITY_TINT, formatDuration, minutesBetween } from "@/app/lib/api";
-import { Clock, Calendar, MoveRight } from "lucide-react";
+import type { Block, Busy, Intent, Priority } from "@/app/lib/api";
+import { PRIORITY_NAME, PRIORITY_TINT, formatDuration, minutesBetween, subtaskProgress } from "@/app/lib/api";
+import { Clock, Calendar, MoveRight, Check, Circle } from "lucide-react";
 
-const DAY_START_H = 7;
-const DAY_END_H = 21;
+const DAY_START_H = 0;
+const DAY_END_H = 24;
 const PX_PER_HOUR = 60;
 const HEIGHT = (DAY_END_H - DAY_START_H) * PX_PER_HOUR;
 
@@ -25,10 +25,30 @@ const FILL: Record<Priority, string> = {
   4: "color-mix(in srgb, var(--color-accent) 3%, transparent)",
 };
 
+const PALETTE: Record<string, string> = {
+  blue: "#3b82f6",
+  green: "#22c55e",
+  red: "#ef4444",
+  yellow: "#eab308",
+  purple: "#a855f7",
+  pink: "#ec4899",
+  orange: "#f97316",
+  slate: "#64748b",
+};
+
+function assignedColor(value: string | null | undefined): string | undefined {
+  if (!value) return undefined;
+  return /^#[0-9a-fA-F]{6}$/.test(value) ? value : PALETTE[value];
+}
+
 const PRIORITY_LABEL = PRIORITY_NAME;
 
 function dayKey(iso: string): string {
   return iso.slice(0, 10);
+}
+
+function localDayKey(date: Date): string {
+  return [date.getFullYear(), String(date.getMonth() + 1).padStart(2, "0"), String(date.getDate()).padStart(2, "0")].join("-");
 }
 
 function offsetPx(iso: string): number {
@@ -45,24 +65,29 @@ export interface GridProps {
   days: Date[];
   blocks: Block[];
   busy: Busy[];
+  intents?: Intent[];
   selected: string | null;
   onSelect: (key: string | null) => void;
+  onToggleComplete?: (block: Block) => void;
+  completing?: string | null;
+  focusNow?: boolean;
 }
 
 /** Ultra-Luxury Week Planner Grid Component.
  *  Includes vibrant current-day pill badges, translucent glass blocks,
  *  dashed borders for relocated tasks, and soft-edge scroll container masks.
  */
-export function Grid({ days, blocks, busy, selected, onSelect }: GridProps) {
+export function Grid({ days, blocks, busy, intents = [], selected, onSelect, onToggleComplete, completing, focusNow = false }: GridProps) {
+  const scrollRef = useRef<HTMLDivElement>(null);
   const hours = Array.from(
     { length: DAY_END_H - DAY_START_H },
     (_, i) => DAY_START_H + i,
   );
   const todayStr = new Date().toDateString();
-  const todayKey = new Date().toISOString().slice(0, 10);
 
   // Ticks once a minute so the "now" line drifts without a full data reload.
   const [now, setNow] = useState(() => new Date());
+  const todayKey = localDayKey(now);
   useEffect(() => {
     const id = setInterval(() => setNow(new Date()), 60_000);
     return () => clearInterval(id);
@@ -70,11 +95,25 @@ export function Grid({ days, blocks, busy, selected, onSelect }: GridProps) {
   const nowTop = offsetPx(now.toISOString());
   const showNowLine = nowTop >= 0 && nowTop <= HEIGHT;
 
+  // Position the initial view near now, then leave scrolling entirely to the
+  // user. The ticking now-line must never pull the timeline back into place.
+  useEffect(() => {
+    const viewport = scrollRef.current;
+    if (!viewport) return;
+    viewport.scrollTop = focusNow
+      ? Math.max(0, offsetPx(new Date().toISOString()) - viewport.clientHeight * 0.35)
+      : 0;
+  }, [focusNow]);
+
   return (
-    <div className="scroll-x scroll-mask-x rounded-card border border-black/[0.08] bg-surface shadow-sm transition-shadow hover:shadow-md">
+    <div
+      ref={scrollRef}
+      aria-label="Daily timeline; scroll vertically to view all 24 hours"
+      className="h-[70dvh] min-h-[360px] max-h-[760px] overflow-auto rounded-card border border-black/[0.08] bg-surface shadow-sm transition-shadow hover:shadow-md"
+    >
       <div className="min-w-[900px]">
         {/* Day Header Rail */}
-        <div className="sticky top-0 z-20 flex border-b border-black/[0.06] bg-surface/90 backdrop-blur-xl">
+        <div className="sticky top-0 z-30 flex border-b border-black/[0.06] bg-surface backdrop-blur-xl">
           <div className="w-14 shrink-0 border-r border-black/[0.06]" />
           {days.map((day) => {
             const isToday = day.toDateString() === todayStr;
@@ -103,7 +142,7 @@ export function Grid({ days, blocks, busy, selected, onSelect }: GridProps) {
         </div>
 
         {/* Calendar Body */}
-        <div className="flex">
+        <div className="flex pt-5">
           {/* Time Rail */}
           <div className="w-14 shrink-0 border-r border-black/[0.06] bg-sunk/30">
             {hours.map((hour) => (
@@ -122,7 +161,7 @@ export function Grid({ days, blocks, busy, selected, onSelect }: GridProps) {
 
           {/* Grid Columns */}
           {days.map((day) => {
-            const key = day.toISOString().slice(0, 10);
+            const key = localDayKey(day);
             const dayBlocks = blocks.filter((b) => dayKey(b.start) === key);
             const dayBusy = busy.filter((b) => dayKey(b.start) === key);
 
@@ -187,32 +226,38 @@ export function Grid({ days, blocks, busy, selected, onSelect }: GridProps) {
                   const height = Math.max(24, (minutes / 60) * PX_PER_HOUR);
                   const moved = block.moved_from !== null && block.moved_from !== block.start;
                   const isSelected = selected === id;
+                  const color = assignedColor(block.color);
+                  const rule = color ?? RULE[block.priority];
+                  const intent = intents.find((item) => item.id === block.intent_id);
+                  const progress = intent ? subtaskProgress(intent, dayKey(block.start)) : null;
 
                   const isLinear = block.title.toLowerCase().includes("linear");
                   const isGithub = block.title.toLowerCase().includes("github");
                   const isTodoist = block.title.toLowerCase().includes("todoist");
 
                   return (
+                    <div key={id}>
                       <button
-                        key={id}
                         type="button"
                         onClick={() => onSelect(isSelected ? null : id)}
                         style={{
                           top,
                           height,
-                          background: FILL[block.priority],
-                          borderLeft: `3px ${moved ? "dashed" : "solid"} ${RULE[block.priority]}`,
+                          background: color
+                            ? `color-mix(in srgb, ${color} 28%, var(--color-surface))`
+                            : FILL[block.priority],
+                          borderLeft: `3px ${moved ? "dashed" : "solid"} ${rule}`,
                         }}
-                        className={`group absolute inset-x-1.5 z-10 cursor-pointer overflow-hidden rounded-block border border-black/[0.08] px-2.5 py-1 text-left transition-all duration-200 ease-spring hover:scale-[1.01] hover:shadow-md ${
+                        className={`group absolute inset-x-1.5 z-10 cursor-pointer overflow-hidden rounded-block border border-black/[0.08] px-2.5 py-1 pr-7 text-left transition-all duration-200 ease-spring hover:scale-[1.01] hover:shadow-md ${
                           isSelected ? "shadow-md ring-2 ring-accent/40" : "shadow-xs"
-                        } ${moved ? "settle" : ""}`}
+                        } ${moved ? "settle" : ""} ${block.completed ? "opacity-70" : ""}`}
                       >
                         <div className="flex items-center justify-between gap-1.5">
                           <div className="flex items-center gap-1.5 min-w-0">
-                            <span style={{ color: RULE[block.priority] }}>
+                            <span style={{ color: rule }}>
                               <Glyph kind={block.kind} size={13} />
                             </span>
-                            <span className="truncate text-[12px] font-semibold text-fg leading-tight">
+                            <span className={`truncate text-[12px] font-semibold text-fg leading-tight ${block.completed ? "line-through" : ""}`}>
                               {block.title}
                             </span>
                           </div>
@@ -248,7 +293,25 @@ export function Grid({ days, blocks, busy, selected, onSelect }: GridProps) {
                             <span>{formatDuration(minutes)}</span>
                           </div>
                         )}
+                        {height > 52 && progress && progress.total > 0 && (
+                          <div className="mt-0.5 truncate text-[10px] font-semibold text-fg-muted">{progress.done}/{progress.total} goals done</div>
+                        )}
                       </button>
+                      {onToggleComplete && (block.completed || block.start.slice(0, 10) <= todayKey) && (
+                        <button
+                          type="button"
+                          onClick={() => onToggleComplete(block)}
+                          disabled={completing === id}
+                          aria-label={`${block.completed ? "Mark not done" : "Mark done"}: ${block.title}`}
+                          aria-pressed={block.completed}
+                          title={block.completed ? "Mark not done" : "Mark done"}
+                          style={{ top: top + 4 }}
+                          className="absolute right-3 z-20 flex h-4 w-4 items-center justify-center rounded-full bg-surface text-accent shadow-sm disabled:opacity-40"
+                        >
+                          {block.completed ? <Check size={12} strokeWidth={3} /> : <Circle size={15} />}
+                        </button>
+                      )}
+                    </div>
                     );
                 })}
               </div>

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import sys
@@ -15,16 +16,17 @@ import time
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime, timedelta
-from typing import Annotated, Any
+from datetime import UTC, date, datetime, timedelta
+from typing import Annotated, Any, Literal
 from urllib.parse import urlencode
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
-from pydantic import AfterValidator, BaseModel, Field
+from pydantic import AfterValidator, BaseModel, Field, field_validator, model_validator
 from sqlalchemy import delete, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette.sse import EventSourceResponse
 
@@ -33,6 +35,8 @@ from horolog.analytics import Analytics, analyse
 from horolog.capture import capture, to_payload
 from horolog.db import (
     BusyRow,
+    CalendarBlockRow,
+    CreationRequestRow,
     IntentRow,
     SyncedBlockRow,
     init_db,
@@ -42,7 +46,7 @@ from horolog.db import (
     session,
 )
 from horolog.domain.events import BusyInterval
-from horolog.domain.intent import DailyWindow, EnergyLevel, Intent, IntentKind, Priority
+from horolog.domain.intent import DailyWindow, EnergyLevel, Intent, IntentKind, Priority, Subtask
 from horolog.domain.plan import Plan
 from horolog.domain.time import (
     SLOT_MINUTES,
@@ -53,11 +57,17 @@ from horolog.domain.time import (
 )
 from horolog.integrations.clickup import ClickUpError, fetch_clickup_tasks
 from horolog.integrations.github import GithubError, fetch_github_issues
-from horolog.integrations.google_calendar import GoogleCalendarProvider, GoogleCalendarWriter
+from horolog.integrations.google_calendar import (
+    GoogleCalendarProvider,
+    GoogleCalendarWriter,
+)
 from horolog.integrations.jira import JiraError, fetch_jira_issues
 from horolog.integrations.linear import LinearError, fetch_linear_issues
 from horolog.integrations.notion import NotionError, fetch_notion_tasks
-from horolog.integrations.outlook_calendar import OutlookCalendarProvider, OutlookCalendarWriter
+from horolog.integrations.outlook_calendar import (
+    OutlookCalendarProvider,
+    OutlookCalendarWriter,
+)
 from horolog.integrations.todoist import TodoistError, fetch_todoist_tasks
 from horolog.integrations.zoom import ZoomError, create_meeting, delete_meeting
 from horolog.llm import (
@@ -148,11 +158,26 @@ LocalDateTime = Annotated[datetime, AfterValidator(_localise)]
 
 class IntentIn(BaseModel):
     title: str = Field(min_length=1, max_length=200)
+    color: str | None = Field(default=None, max_length=32)
+    tags: list[str] = Field(default_factory=list)
     kind: IntentKind = IntentKind.TASK
     priority: Priority = Priority.P3
     energy: EnergyLevel | None = None
     minutes_per_period: int = Field(gt=0)
     period_days: int | None = Field(default=None, gt=0)
+    allowed_weekdays: list[int] | None = Field(default=None, min_length=1)
+
+    @field_validator("allowed_weekdays")
+    @classmethod
+    def validate_allowed_weekdays(cls, value: list[int] | None) -> list[int] | None:
+        if value is None:
+            return None
+        if any(day < 0 or day > 6 for day in value):
+            raise ValueError("Weekdays must be between 0 (Monday) and 6 (Sunday)")
+        if len(value) != len(set(value)):
+            raise ValueError("Duplicate weekdays are not allowed")
+        return value
+
     min_chunk_minutes: int = Field(default=30, gt=0)
     max_chunk_minutes: int = Field(default=120, gt=0)
     max_per_day: int | None = Field(default=None, gt=0)
@@ -177,25 +202,40 @@ class IntentIn(BaseModel):
         end = self.window_end_min if self.window_end_min is not None else cfg.workday_end_min
         return Intent(
             id=ident,
+            slot_origin=base,
             kind=self.kind,
             title=self.title,
+            color=self.color,
+            tags=self.tags,
             priority=self.priority,
             energy=self.energy,
             minutes_per_period=self.minutes_per_period,
             period_days=self.period_days,
+            allowed_weekdays=self.allowed_weekdays,
             min_chunk_minutes=self.min_chunk_minutes,
             max_chunk_minutes=self.max_chunk_minutes,
             max_per_day=self.max_per_day,
             daily_windows=[DailyWindow(start_min=start, end_min=end)],
-            earliest_slot=to_slot(self.earliest, base) if self.earliest else None,
+            earliest_slot=to_slot(self.earliest, base, round_up=True) if self.earliest else None,
             due_slot=to_slot(self.due, base) if self.due else None,
             preferred_start_min=self.preferred_start_min,
             blocked_slots=[
-                (to_slot(a.start, base), to_slot(a.end, base))
+                (to_slot(a.start, base), to_slot(a.end, base, round_up=True))
                 for a in self.attendee_busy
-                if to_slot(a.end, base) > to_slot(a.start, base)
             ],
         )
+
+
+class IntentPatch(IntentIn):
+    """IntentIn wire fields; omitted defaults are never applied on PATCH."""
+
+    model_config = {"extra": "forbid"}
+    title: str = Field(default="", min_length=1, max_length=200)
+    minutes_per_period: int = Field(default=0, gt=0)
+    daily_windows: list[DailyWindow] = Field(default_factory=list)
+    add_tags: list[str] = Field(default_factory=list)
+    remove_tags: list[str] = Field(default_factory=list)
+    session_minutes: int | None = Field(default=None, gt=0)
 
 
 class AttendeeBusy(BaseModel):
@@ -205,6 +245,12 @@ class AttendeeBusy(BaseModel):
     end: LocalDateTime
     attendee: str = ""
 
+    @model_validator(mode="after")
+    def ordered(self) -> AttendeeBusy:
+        if self.end.astimezone(UTC) <= self.start.astimezone(UTC):
+            raise ValueError("attendee busy end must exceed start")
+        return self
+
 
 class BusyIn(BaseModel):
     label: str = ""
@@ -213,8 +259,58 @@ class BusyIn(BaseModel):
     source: str = "manual"
 
 
+class CalendarBlockIn(BaseModel):
+    model_config = {"extra": "forbid"}
+    title: str = Field(min_length=1, max_length=200)
+    start: LocalDateTime | None = None
+    end: LocalDateTime | None = None
+    all_day_date: date | None = None
+    end_date: date | None = None
+
+    def bounds(self) -> tuple[datetime, datetime]:
+        zone = settings().zone
+        if not self.title.strip():
+            raise ValueError("title must not be blank")
+        if self.all_day_date is not None:
+            if self.start is not None or self.end is not None:
+                raise ValueError("use all_day_date or start/end, not both")
+            end_date = self.end_date or self.all_day_date + timedelta(days=1)
+            start = datetime.combine(self.all_day_date, datetime.min.time(), tzinfo=zone)
+            end = datetime.combine(end_date, datetime.min.time(), tzinfo=zone)
+        else:
+            if self.start is None or self.end is None or self.end_date is not None:
+                raise ValueError("supply both start and end, or all_day_date")
+            start, end = self.start.astimezone(zone), self.end.astimezone(zone)
+        if end.astimezone(UTC) <= start.astimezone(UTC):
+            raise ValueError("end must exceed start; end_date is exclusive")
+        return start, end
+
+
+def _calendar_block_bounds(row: CalendarBlockRow) -> tuple[datetime, datetime]:
+    # SQLite drops timezone metadata; persisted values are always UTC.
+    zone = settings().zone
+    return (
+        row.start_at.replace(tzinfo=UTC).astimezone(zone),
+        row.end_at.replace(tzinfo=UTC).astimezone(zone),
+    )
+
+
+def _calendar_block_out(row: CalendarBlockRow) -> dict[str, Any]:
+    start, end = _calendar_block_bounds(row)
+    return {
+        "id": row.id,
+        "title": row.title,
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "all_day": row.all_day,
+        "source": "calendar-block",
+    }
+
+
 class BlockOut(BaseModel):
     intent_id: str
+    color: str | None = None
+    tags: list[str] = Field(default_factory=list)
     title: str
     kind: IntentKind
     priority: Priority
@@ -224,12 +320,17 @@ class BlockOut(BaseModel):
     start: datetime
     end: datetime
     moved_from: datetime | None = None
+    deadline: datetime | None = None
+    late_by_minutes: int = 0
+    completed: bool = False
+    recurring: bool = False
 
 
 class UnmetOut(BaseModel):
     intent_id: str
     title: str
     priority: Priority
+    occurrence: int
     shortfall_minutes: int
 
 
@@ -318,14 +419,42 @@ async def health(db: AsyncSession = Depends(session)) -> dict[str, str]:
     return {"status": "ok"}
 
 
+async def _reserve_creation(
+    db: AsyncSession, scope: str, key: str | None, payload: dict[str, Any], ident: str
+) -> tuple[str, bool]:
+    if key is None:
+        return ident, False
+    if not key.strip():
+        raise HTTPException(status_code=422, detail="Idempotency-Key must not be blank")
+    request_id = hashlib.sha256(f"{scope}:{key}".encode()).hexdigest()
+    payload_hash = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+    request = CreationRequestRow(id=request_id, payload_hash=payload_hash, resource_id=ident)
+    db.add(request)
+    try:
+        await db.flush()
+    except IntegrityError:
+        await db.rollback()
+        existing = await db.get(CreationRequestRow, request_id)
+        if existing is None or existing.payload_hash != payload_hash:
+            raise HTTPException(
+                status_code=409, detail="retry key already used for different input"
+            ) from None
+        return existing.resource_id, True
+    return ident, False
+
+
 @app.get("/api/intents")
 async def list_intents(db: AsyncSession = Depends(session)) -> list[dict[str, Any]]:
     rows = (await db.execute(select(IntentRow))).scalars().all()
-    return [row.payload for row in rows]
+    return [row.to_domain().for_origin(origin()).model_dump(mode="json") for row in rows]
 
 
 @app.post("/api/intents", status_code=201)
-async def create_intent(body: IntentIn, db: AsyncSession = Depends(session)) -> dict[str, Any]:
+async def create_intent(
+    body: IntentIn,
+    db: AsyncSession = Depends(session),
+    idempotency_key: Annotated[str | None, Header(max_length=128)] = None,
+) -> dict[str, Any]:
     ident = uuid.uuid4().hex[:12]
     try:
         intent = body.to_domain(ident, origin())
@@ -334,6 +463,15 @@ async def create_intent(body: IntentIn, db: AsyncSession = Depends(session)) -> 
         # generic 500, because it explains exactly why the intent is impossible.
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    ident, reused = await _reserve_creation(
+        db, "intent", idempotency_key, body.model_dump(mode="json"), ident
+    )
+    if reused:
+        existing = await db.get(IntentRow, ident)
+        if existing is None:
+            raise HTTPException(status_code=409, detail="original task has been deleted")
+        await _replan(db)
+        return existing.to_domain().for_origin(origin()).model_dump(mode="json")
     if intent.kind == IntentKind.MEETING:
         cfg = settings()
         if cfg.zoom_account_id and cfg.zoom_client_id and cfg.zoom_client_secret:
@@ -442,10 +580,13 @@ async def complete_intent(intent_id: str, db: AsyncSession = Depends(session)) -
     if intent.period_days is not None:
         raise HTTPException(
             status_code=422,
-            detail="only a one-shot task can be marked complete — a recurring "
-            "habit needs per-occurrence completion, not built yet",
+            detail="use a session date to complete a recurring task",
         )
-    intent = intent.model_copy(update={"completed_at": datetime.now(UTC)})
+    finished = datetime.now(UTC)
+    intent = intent.model_copy(update={
+        "completed_at": finished,
+        "subtasks": [item.model_copy(update={"completed_at": finished}) for item in intent.subtasks],
+    })
     row.payload = intent.model_dump(mode="json")
     await db.commit()
     await _replan(db)
@@ -458,10 +599,280 @@ async def uncomplete_intent(intent_id: str, db: AsyncSession = Depends(session))
     row = await db.get(IntentRow, intent_id)
     if row is None:
         raise HTTPException(status_code=404, detail=f"no intent {intent_id!r}")
-    intent = Intent.model_validate(row.payload).model_copy(update={"completed_at": None})
+    previous = Intent.model_validate(row.payload)
+    intent = previous.model_copy(update={
+        "completed_at": None,
+        "subtasks": [item.model_copy(update={"completed_at": None}) for item in previous.subtasks],
+    })
     row.payload = intent.model_dump(mode="json")
     await db.commit()
     await _replan(db)
+    return intent.model_dump(mode="json")
+
+
+@app.put("/api/intents/{intent_id}/completed-dates/{day}")
+async def complete_session(
+    intent_id: str, day: date, db: AsyncSession = Depends(session)
+) -> dict[str, Any]:
+    row = await db.get(IntentRow, intent_id, with_for_update=True)
+    if row is None:
+        raise HTTPException(status_code=404, detail="task not found")
+    intent = row.to_domain()
+    if intent.period_days is None:
+        raise HTTPException(status_code=422, detail="use task completion for a one-time task")
+    intent = intent.model_copy(update={
+        "completed_dates": sorted({*intent.completed_dates, day}),
+        "subtasks": [item.model_copy(update={"completed_dates": sorted({*item.completed_dates, day})}) if item.for_date in (None, day) else item for item in intent.subtasks],
+    })
+    row.payload = intent.model_dump(mode="json")
+    await db.commit()
+    bus.publish(json.dumps({"intent_id": intent_id, "completed_date": day.isoformat()}))
+    return intent.model_dump(mode="json")
+
+
+@app.delete("/api/intents/{intent_id}/completed-dates/{day}")
+async def uncomplete_session(
+    intent_id: str, day: date, db: AsyncSession = Depends(session)
+) -> dict[str, Any]:
+    row = await db.get(IntentRow, intent_id, with_for_update=True)
+    if row is None:
+        raise HTTPException(status_code=404, detail="task not found")
+    intent = row.to_domain()
+    if intent.period_days is None:
+        raise HTTPException(status_code=422, detail="use task completion for a one-time task")
+    intent = intent.model_copy(update={
+        "completed_dates": [d for d in intent.completed_dates if d != day],
+        "subtasks": [item.model_copy(update={"completed_dates": [d for d in item.completed_dates if d != day]}) if item.for_date in (None, day) else item for item in intent.subtasks],
+    })
+    row.payload = intent.model_dump(mode="json")
+    await db.commit()
+    bus.publish(json.dumps({"intent_id": intent_id, "completed_date": day.isoformat()}))
+    return intent.model_dump(mode="json")
+
+
+class SubtaskIn(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+
+    @field_validator("title")
+    @classmethod
+    def nonblank_title(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("subtask title cannot be blank")
+        return value
+
+
+@app.post("/api/intents/{intent_id}/subtasks", status_code=201)
+async def add_subtask(
+    intent_id: str, body: SubtaskIn, day: date | None = None,
+    db: AsyncSession = Depends(session),
+) -> dict[str, Any]:
+    row = await db.get(IntentRow, intent_id, with_for_update=True)
+    if row is None:
+        raise HTTPException(status_code=404, detail="task not found")
+    intent = row.to_domain()
+    if len(intent.subtasks) >= 100:
+        raise HTTPException(status_code=422, detail="a task can have at most 100 subtasks")
+    if intent.period_days is not None and day is None:
+        raise HTTPException(status_code=422, detail="a date is required for recurring tasks")
+    item = Subtask(
+        id=uuid.uuid4().hex[:12], title=body.title, for_date=day,
+    )
+    updates: dict[str, Any] = {"subtasks": [*intent.subtasks, item]}
+    replan = False
+    if intent.period_days is None and intent.completed_at is not None:
+        updates["completed_at"] = None
+        replan = True
+    elif day in intent.completed_dates:
+        updates["completed_dates"] = [d for d in intent.completed_dates if d != day]
+    intent = intent.model_copy(update=updates)
+    row.payload = intent.model_dump(mode="json")
+    await db.commit()
+    if replan:
+        await _replan(db)
+    else:
+        bus.publish(json.dumps({"intent_id": intent_id}))
+    return intent.model_dump(mode="json")
+
+
+@app.put("/api/intents/{intent_id}/subtasks/{subtask_id}/complete")
+@app.delete("/api/intents/{intent_id}/subtasks/{subtask_id}/complete")
+async def set_subtask_completion(
+    intent_id: str, subtask_id: str, request: Request, day: date | None = None,
+    db: AsyncSession = Depends(session),
+) -> dict[str, Any]:
+    row = await db.get(IntentRow, intent_id, with_for_update=True)
+    if row is None:
+        raise HTTPException(status_code=404, detail="task not found")
+    intent = row.to_domain()
+    matching = next((item for item in intent.subtasks if item.id == subtask_id), None)
+    if matching is None:
+        raise HTTPException(status_code=404, detail="subtask not found")
+    if intent.period_days is not None and day is None:
+        raise HTTPException(status_code=422, detail="a date is required for recurring tasks")
+    if matching.for_date is not None and matching.for_date != day:
+        raise HTTPException(status_code=422, detail="this goal belongs to another date")
+    complete = request.method == "PUT"
+    finished = datetime.now(UTC)
+    subtasks = []
+    for item in intent.subtasks:
+        if item.id != subtask_id:
+            subtasks.append(item)
+        elif intent.period_days is None:
+            subtasks.append(item.model_copy(update={"completed_at": finished if complete else None}))
+        else:
+            dates = ({*item.completed_dates, day} if complete else set(item.completed_dates) - {day})
+            subtasks.append(item.model_copy(update={"completed_dates": sorted(dates)}))
+    updates: dict[str, Any] = {"subtasks": subtasks}
+    replan = False
+    if intent.period_days is None:
+        all_done = all(item.completed_at is not None for item in subtasks)
+        if all_done != (intent.completed_at is not None):
+            updates["completed_at"] = finished if all_done else None
+            replan = True
+    else:
+        dates = set(intent.completed_dates)
+        active = [item for item in subtasks if item.for_date in (None, day)]
+        if active and all(day in item.completed_dates for item in active):
+            dates.add(day)
+        else:
+            dates.discard(day)
+        updates["completed_dates"] = sorted(dates)
+    intent = intent.model_copy(update=updates)
+    row.payload = intent.model_dump(mode="json")
+    await db.commit()
+    if replan:
+        await _replan(db)
+    else:
+        bus.publish(json.dumps({"intent_id": intent_id}))
+    return intent.model_dump(mode="json")
+
+
+@app.delete("/api/intents/{intent_id}/subtasks/{subtask_id}")
+async def remove_subtask(
+    intent_id: str, subtask_id: str, db: AsyncSession = Depends(session)
+) -> dict[str, Any]:
+    row = await db.get(IntentRow, intent_id, with_for_update=True)
+    if row is None:
+        raise HTTPException(status_code=404, detail="task not found")
+    intent = row.to_domain()
+    subtasks = [item for item in intent.subtasks if item.id != subtask_id]
+    if len(subtasks) == len(intent.subtasks):
+        raise HTTPException(status_code=404, detail="subtask not found")
+    updates: dict[str, Any] = {"subtasks": subtasks}
+    replan = False
+    if intent.period_days is None and subtasks and all(item.completed_at for item in subtasks):
+        if intent.completed_at is None:
+            updates["completed_at"] = datetime.now(UTC)
+            replan = True
+    intent = intent.model_copy(update=updates)
+    row.payload = intent.model_dump(mode="json")
+    await db.commit()
+    if replan:
+        await _replan(db)
+    else:
+        bus.publish(json.dumps({"intent_id": intent_id}))
+    return intent.model_dump(mode="json")
+
+
+@app.get("/api/intents/{intent_id}")
+async def get_intent(intent_id: str, db: AsyncSession = Depends(session)) -> dict[str, Any]:
+    row = await db.get(IntentRow, intent_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"no intent {intent_id!r}")
+    return row.to_domain().for_origin(origin()).model_dump(mode="json")
+
+
+@app.patch("/api/intents/{intent_id}")
+async def patch_intent(
+    intent_id: str, body: IntentPatch, db: AsyncSession = Depends(session)
+) -> dict[str, Any]:
+    """Merge supplied wire fields, then validate the complete Intent.
+
+    Tags replaces the list; add_tags and remove_tags apply afterwards (remove wins).
+    daily_windows replaces all windows; window_start/end_min edits the first window.
+    Explicit null clears nullable bounds, recurrence, weekdays, or color.
+    """
+    row = await db.get(IntentRow, intent_id, with_for_update=True)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"no intent {intent_id!r}")
+    base = origin()
+    previous = row.to_domain().for_origin(base)
+    updates = body.model_dump(exclude_unset=True)
+    try:
+        for wire, stored in (("due", "due_slot"), ("earliest", "earliest_slot")):
+            if wire in updates:
+                value = updates.pop(wire)
+                updates[stored] = (
+                    to_slot(value, base, round_up=wire == "earliest") if value is not None else None
+                )
+        window_fields = {"window_start_min", "window_end_min"} & updates.keys()
+        if window_fields:
+            if "daily_windows" in updates:
+                raise ValueError("use daily_windows or window_start/end_min, not both")
+            windows = [w.model_dump() for w in previous.daily_windows]
+            if not windows:
+                windows = [{"start_min": 0, "end_min": 1440}]
+            for wire in window_fields:
+                value = updates.pop(wire)
+                if value is None:
+                    raise ValueError("use daily_windows=[] to clear time windows")
+                windows[0][wire.removeprefix("window_")] = value
+            updates["daily_windows"] = windows
+        if "attendee_busy" in updates:
+            updates.pop("attendee_busy")
+            updates["blocked_slots"] = [
+                (to_slot(a.start, base), to_slot(a.end, base, round_up=True))
+                for a in body.attendee_busy
+            ]
+        additions = updates.pop("add_tags", [])
+        removals = updates.pop("remove_tags", [])
+        if additions or removals:
+            updates["tags"] = list(
+                dict.fromkeys(
+                    tag
+                    for tag in [*updates.get("tags", previous.tags), *additions]
+                    if tag not in removals
+                )
+            )
+        session = updates.pop("session_minutes", None)
+        if session is not None or (
+            "allowed_weekdays" in updates
+            and "minutes_per_period" not in updates
+            and previous.fixed_weekly_sessions
+            and updates.get("period_days", previous.period_days) == 7
+            and updates["allowed_weekdays"]
+        ):
+            if (
+                "minutes_per_period" in updates
+                or {"min_chunk_minutes", "max_chunk_minutes"} & updates.keys()
+            ):
+                raise ValueError(
+                    "session_minutes cannot be combined with demand or chunk overrides"
+                )
+            weekdays = updates.get("allowed_weekdays", previous.allowed_weekdays)
+            if updates.get("period_days", previous.period_days) != 7 or not weekdays:
+                raise ValueError("session editing requires weekly fixed sessions and weekdays")
+            session = session or previous.min_chunk_minutes
+            updates.update(
+                minutes_per_period=session * len(weekdays),
+                min_chunk_minutes=session,
+                max_chunk_minutes=session,
+                max_per_day=1,
+            )
+        intent = Intent.model_validate(previous.model_dump() | updates)
+        if intent.skipped_dates and not intent.fixed_weekly_sessions:
+            raise ValueError("restore skipped sessions before changing the recurrence shape")
+        if intent.completed_at is not None and intent.period_days is not None:
+            raise ValueError("uncomplete a task before converting it to recurrence")
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    row.payload = intent.model_dump(mode="json")
+    await db.commit()
+    if updates.keys() - {"title", "color", "tags"}:
+        await _replan(db)
+    else:
+        bus.publish(json.dumps({"intent_id": intent_id}))
     return intent.model_dump(mode="json")
 
 
@@ -499,12 +910,173 @@ async def update_intent(
             "zoom_meeting_id": previous.zoom_meeting_id,
             "zoom_join_url": previous.zoom_join_url,
             "completed_at": previous.completed_at,
+            "completed_dates": previous.completed_dates,
+            "subtasks": previous.subtasks,
+            "skipped_dates": previous.skipped_dates,
         }
     )
+    if intent.completed_at is not None and intent.period_days is not None:
+        raise HTTPException(
+            status_code=422, detail="uncomplete a task before converting to recurrence"
+        )
+    if intent.skipped_dates and not intent.fixed_weekly_sessions:
+        raise HTTPException(
+            status_code=422, detail="restore skipped sessions before changing recurrence"
+        )
     row.payload = intent.model_dump(mode="json")
     await db.commit()
     await _replan(db)
     return intent.model_dump(mode="json")
+
+
+@app.post("/api/intents/{intent_id}/skips/{skipped_date}")
+async def skip_session(
+    intent_id: str, skipped_date: date, db: AsyncSession = Depends(session)
+) -> dict[str, Any]:
+    row = await db.get(IntentRow, intent_id, with_for_update=True)
+    if row is None:
+        raise HTTPException(status_code=404, detail="task not found")
+    intent = row.to_domain().for_origin(origin())
+    if not intent.fixed_weekly_sessions:
+        raise HTTPException(status_code=422, detail="skipping requires fixed weekly sessions")
+    if skipped_date < origin().date() or skipped_date.weekday() not in (
+        intent.allowed_weekdays or []
+    ):
+        raise HTTPException(
+            status_code=422, detail="choose a future/today date on an allowed weekday"
+        )
+    intent = Intent.model_validate(
+        intent.model_dump() | {"skipped_dates": sorted({*intent.skipped_dates, skipped_date})}
+    )
+    row.payload = intent.model_dump(mode="json")
+    await db.commit()
+    return {
+        "task": intent.model_dump(mode="json"),
+        "plan": (await _render(db, await _replan(db))).model_dump(mode="json"),
+    }
+
+
+@app.delete("/api/intents/{intent_id}/skips/{skipped_date}")
+async def restore_session(
+    intent_id: str, skipped_date: date, db: AsyncSession = Depends(session)
+) -> dict[str, Any]:
+    row = await db.get(IntentRow, intent_id, with_for_update=True)
+    if row is None:
+        raise HTTPException(status_code=404, detail="task not found")
+    intent = row.to_domain()
+    row.payload = intent.model_copy(
+        update={"skipped_dates": [day for day in intent.skipped_dates if day != skipped_date]}
+    ).model_dump(mode="json")
+    await db.commit()
+    return {
+        "task": row.to_domain().for_origin(origin()).model_dump(mode="json"),
+        "plan": (await _render(db, await _replan(db))).model_dump(mode="json"),
+    }
+
+
+@app.get("/api/calendar-blocks")
+async def list_calendar_blocks(db: AsyncSession = Depends(session)) -> list[dict[str, Any]]:
+    rows = (
+        (
+            await db.execute(
+                select(CalendarBlockRow).order_by(CalendarBlockRow.start_at, CalendarBlockRow.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return [_calendar_block_out(row) for row in rows]
+
+
+@app.post("/api/calendar-blocks", status_code=201)
+async def create_calendar_block(
+    body: CalendarBlockIn,
+    db: AsyncSession = Depends(session),
+    idempotency_key: Annotated[str | None, Header(max_length=128)] = None,
+) -> dict[str, Any]:
+    """Add one fixed commitment without replacing any existing busy events."""
+    try:
+        start, end = body.bounds()
+    except (ValueError, OverflowError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    ident, reused = await _reserve_creation(
+        db, "calendar-block", idempotency_key, body.model_dump(mode="json"), uuid.uuid4().hex
+    )
+    if reused:
+        existing = await db.get(CalendarBlockRow, ident)
+        if existing is None:
+            raise HTTPException(status_code=409, detail="original block has been deleted")
+        return _calendar_block_out(existing) | {
+            "plan": (await _render(db, await _replan(db))).model_dump(mode="json")
+        }
+    row = CalendarBlockRow(
+        id=ident,
+        title=body.title,
+        start_at=start.astimezone(UTC),
+        end_at=end.astimezone(UTC),
+        all_day=body.all_day_date is not None,
+    )
+    db.add(row)
+    await db.commit()
+    plan = await _replan(db)
+    return _calendar_block_out(row) | {"plan": (await _render(db, plan)).model_dump(mode="json")}
+
+
+class CalendarBlockPatch(CalendarBlockIn):
+    title: str = Field(default="", min_length=1, max_length=200)
+
+
+@app.patch("/api/calendar-blocks/{block_id}")
+async def update_calendar_block(
+    block_id: str, body: CalendarBlockPatch, db: AsyncSession = Depends(session)
+) -> dict[str, Any]:
+    row = await db.get(CalendarBlockRow, block_id, with_for_update=True)
+    if row is None:
+        raise HTTPException(status_code=404, detail="calendar block not found")
+    start, end = _calendar_block_bounds(row)
+    changes = body.model_dump(exclude_unset=True)
+    previous: dict[str, Any] = {"title": row.title}
+    if row.all_day:
+        previous.update(all_day_date=start.date(), end_date=end.date())
+        if "all_day_date" in changes and "end_date" not in changes:
+            try:
+                changes["end_date"] = (
+                    changes["all_day_date"] + (end.date() - start.date())
+                    if changes["all_day_date"]
+                    else None
+                )
+            except OverflowError as exc:
+                raise HTTPException(
+                    status_code=422, detail="end date is outside the supported range"
+                ) from exc
+        if "start" in changes or "end" in changes:
+            previous.update(all_day_date=None, end_date=None)
+    else:
+        previous.update(start=start, end=end)
+        if "all_day_date" in changes:
+            previous.update(start=None, end=None)
+    try:
+        merged = CalendarBlockIn.model_validate(previous | changes)
+        start, end = merged.bounds()
+    except (ValueError, OverflowError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    row.title, row.start_at, row.end_at = merged.title, start.astimezone(UTC), end.astimezone(UTC)
+    row.all_day = merged.all_day_date is not None
+    await db.commit()
+    return _calendar_block_out(row) | {
+        "plan": (await _render(db, await _replan(db))).model_dump(mode="json")
+    }
+
+
+@app.delete("/api/calendar-blocks/{block_id}", status_code=204)
+async def delete_calendar_block(block_id: str, db: AsyncSession = Depends(session)) -> Response:
+    row = await db.get(CalendarBlockRow, block_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="calendar block not found")
+    await db.delete(row)
+    await db.commit()
+    await _replan(db)
+    return Response(status_code=204)
 
 
 @app.put("/api/busy", status_code=200)
@@ -953,7 +1525,10 @@ class FreeSlot(BaseModel):
 
 @app.get("/api/availability")
 async def availability(
-    minutes: int = 30, days: int = 7, db: AsyncSession = Depends(session)
+    minutes: int = 30,
+    days: int = 7,
+    db: AsyncSession = Depends(session),
+    mode: Literal["bookable", "idle"] = "bookable",
 ) -> list[FreeSlot]:
     """Openings a guest may book, inside the configured working window.
 
@@ -981,6 +1556,12 @@ async def availability(
     for event in merge_busy(await _busy(db)):
         for slot in range(max(event.start_slot, 0), min(event.end_slot, len(taken))):
             taken[slot] = 1
+
+    if mode == "idle":
+        plan = await load_previous_plan(db) or await _replan(db)
+        for block in plan.blocks:
+            for slot in range(max(block.start_slot, 0), min(block.end_slot, len(taken))):
+                taken[slot] = 1
 
     # Nothing in the past: `origin` is midnight, so most of today is behind us.
     # `to_slot` floors to the slot containing the current instant. That slot's
@@ -1259,7 +1840,7 @@ async def _push_calendar(db: AsyncSession, provider_name: str) -> dict[str, int]
 
     plan = await load_previous_plan(db) or await _replan(db)
     base = origin()
-    titles = {i.id: i for i in await load_intents(db)}
+    titles = {i.id: i for i in await load_intents(db, base)}
     current: dict[tuple[str, int, int], tuple[int, int, str]] = {
         b.key: (
             b.start_slot,
@@ -1389,6 +1970,22 @@ async def _busy(db: AsyncSession) -> list[BusyInterval]:
         )
         for row in rows
     ]
+    # Convert absolute commitments at read time so a date does not drift at midnight.
+    base = origin()
+    fixed = (await db.execute(select(CalendarBlockRow))).scalars().all()
+    for row in fixed:
+        start, end = _calendar_block_bounds(row)
+        end_slot = to_slot(end, base, round_up=True)
+        span = _clip(to_slot(start, base), end_slot)
+        if span is not None:
+            busy.append(
+                BusyInterval(
+                    source_id="calendar-block:" + row.id,
+                    label=row.title,
+                    start_slot=span[0],
+                    end_slot=span[1],
+                )
+            )
     cfg = settings()
     if cfg.auto_buffer_enabled:
         busy += decompression_buffers(busy, cfg.auto_buffer_minutes)
@@ -1396,16 +1993,40 @@ async def _busy(db: AsyncSession) -> list[BusyInterval]:
 
 
 async def _replan(db: AsyncSession) -> Plan:
-    intents = await load_intents(db)
-    plan = solve(intents, await _busy(db), horizon_slots(), previous=await load_previous_plan(db))
+    base = origin()
+    intents = await load_intents(db, base)
+    plan = solve(
+        intents,
+        await _busy(db),
+        horizon_slots(),
+        previous=await load_previous_plan(db),
+        start_weekday=base.weekday(),
+        not_before_slot=max(0, to_slot(datetime.now(settings().zone), base, round_up=True)),
+    )
     await save_plan(db, plan)
     bus.publish(json.dumps({"blocks": len(plan.blocks), "solve_ms": round(plan.solve_ms, 2)}))
     return plan
 
 
+def _deadline(intent: Intent | None, base: datetime) -> datetime | None:
+    return (
+        from_slot(intent.due_slot, base)
+        if intent is not None and intent.due_slot is not None
+        else None
+    )
+
+
+def _lateness(intent: Intent | None, end_slot: int) -> int:
+    return (
+        max(0, end_slot - intent.due_slot) * SLOT_MINUTES
+        if intent is not None and intent.due_slot is not None
+        else 0
+    )
+
+
 async def _render(db: AsyncSession, plan: Plan) -> PlanOut:
     base = origin()
-    titles = {i.id: i for i in await load_intents(db)}
+    titles = {i.id: i for i in await load_intents(db, base)}
     rows = (await db.execute(select(BusyRow))).scalars().all()
     sources = {row.id: row.source for row in rows}
     return PlanOut(
@@ -1413,6 +2034,8 @@ async def _render(db: AsyncSession, plan: Plan) -> PlanOut:
             BlockOut(
                 intent_id=b.intent_id,
                 title=titles[b.intent_id].title if b.intent_id in titles else b.intent_id,
+                color=titles[b.intent_id].color if b.intent_id in titles else None,
+                tags=titles[b.intent_id].tags if b.intent_id in titles else [],
                 kind=titles[b.intent_id].kind if b.intent_id in titles else IntentKind.TASK,
                 priority=b.priority,
                 energy=titles[b.intent_id].energy if b.intent_id in titles else None,
@@ -1421,6 +2044,16 @@ async def _render(db: AsyncSession, plan: Plan) -> PlanOut:
                 start=from_slot(b.start_slot, base),
                 end=from_slot(b.end_slot, base),
                 moved_from=from_slot(b.moved_from, base) if b.moved_from is not None else None,
+                deadline=_deadline(titles.get(b.intent_id), base),
+                late_by_minutes=_lateness(titles.get(b.intent_id), b.end_slot),
+                completed=(
+                    from_slot(b.start_slot, base).date() in titles[b.intent_id].completed_dates
+                    if b.intent_id in titles else False
+                ),
+                recurring=(
+                    titles[b.intent_id].period_days is not None
+                    if b.intent_id in titles else False
+                ),
             )
             for b in plan.blocks
         ],
@@ -1429,6 +2062,7 @@ async def _render(db: AsyncSession, plan: Plan) -> PlanOut:
                 intent_id=u.intent_id,
                 title=titles[u.intent_id].title if u.intent_id in titles else u.intent_id,
                 priority=u.priority,
+                occurrence=u.occurrence,
                 shortfall_minutes=u.shortfall_slots * 15,
             )
             for u in plan.unmet
@@ -1438,7 +2072,11 @@ async def _render(db: AsyncSession, plan: Plan) -> PlanOut:
                 label=event.label,
                 # Derived buffers have no row of their own; the grid still has
                 # to show them, or time disappears with no visible reason.
-                source=sources.get(event.source_id, BUFFER_SOURCE),
+                source=(
+                    "calendar-block"
+                    if event.source_id.startswith("calendar-block:")
+                    else sources.get(event.source_id, BUFFER_SOURCE)
+                ),
                 start=from_slot(event.start_slot, base),
                 end=from_slot(event.end_slot, base),
             )

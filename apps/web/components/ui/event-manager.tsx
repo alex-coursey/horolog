@@ -16,7 +16,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import { Badge } from "@/components/ui/badge"
-import { ChevronLeft, ChevronRight, Plus, Calendar, Clock, Grid3x3, List, Search, Filter, X } from "lucide-react"
+import { ChevronLeft, ChevronRight, Plus, Calendar, Clock, Grid3x3, List, Search, Filter, X, CheckCircle } from "lucide-react"
 import { cn } from "@/lib/utils"
 import {
   DropdownMenu,
@@ -29,6 +29,15 @@ import {
 import { Glyph } from "@/app/components/Glyph"
 import { FILL, RULE } from "@/app/components/Grid"
 import type { IntentKind, Priority } from "@/app/lib/api"
+
+/** Custom colors share the calendar palette; hex permits user-selected accents. */
+function customAccent(color: string): string | undefined {
+  const palette: Record<string, string> = {
+    blue: "#3b82f6", green: "#22c55e", red: "#ef4444", yellow: "#eab308",
+    purple: "#a855f7", pink: "#ec4899", orange: "#f97316", slate: "#64748b",
+  }
+  return /^#[0-9a-fA-F]{6}$/.test(color) ? color : palette[color]
+}
 
 export interface Event {
   id: string
@@ -47,13 +56,17 @@ export interface Event {
    *  see `busyToEvents` in `app/planner/page.tsx`. */
   priority?: Priority
   kind?: IntentKind
+  completed?: boolean
+  completable?: boolean
 }
 
 export interface EventManagerProps {
   events?: Event[]
+  onDayClick?: (date: Date) => void
   onEventCreate?: (event: Omit<Event, "id">) => void
   onEventUpdate?: (id: string, event: Partial<Event>) => void
   onEventDelete?: (id: string) => void
+  onEventToggleComplete?: (id: string) => void
   categories?: string[]
   colors?: { name: string; value: string; bg: string; text: string }[]
   defaultView?: "month" | "week" | "day" | "list"
@@ -72,9 +85,11 @@ const defaultColors = [
 
 export function EventManager({
   events = [],
+  onDayClick,
   onEventCreate,
   onEventUpdate,
   onEventDelete,
+  onEventToggleComplete,
   categories = ["Meeting", "Task", "Reminder", "Personal"],
   colors = defaultColors,
   defaultView = "month",
@@ -684,6 +699,7 @@ export function EventManager({
       {view === "month" && (
         <MonthView
           currentDate={currentDate}
+          onDayClick={onDayClick}
           events={filteredEvents}
           onEventClick={(event) => {
             setSelectedEvent(event)
@@ -699,6 +715,7 @@ export function EventManager({
       {view === "week" && (
         <WeekView
           currentDate={currentDate}
+          onDayClick={onDayClick}
           events={filteredEvents}
           onEventClick={(event) => {
             setSelectedEvent(event)
@@ -910,6 +927,15 @@ export function EventManager({
           </div>
 
           <DialogFooter>
+            {!isCreating && selectedEvent?.completable && (
+              <Button variant="outline" onClick={() => {
+                onEventToggleComplete?.(selectedEvent.id)
+                setIsDialogOpen(false)
+                setSelectedEvent(null)
+              }}>
+                {selectedEvent.completed ? "Mark not done" : "Mark done"}
+              </Button>
+            )}
             {!isCreating && (
               <Button variant="destructive" onClick={() => selectedEvent && handleDeleteEvent(selectedEvent.id)}>
                 Delete
@@ -954,16 +980,12 @@ function EventCard({
   const [isHovered, setIsHovered] = useState(false)
   const colorClasses = getColorClasses(event.color)
 
-  // A block with a priority renders the same Glyph + accent-tint left-rule
-  // system Grid.tsx (the /time page) uses, instead of the generic named
-  // `color` — one source of truth for what priority/kind look like,
-  // wherever a block is drawn. An event with no priority (a real, external,
-  // immovable meeting) keeps the plain `colorClasses` treatment.
+  // Saved custom accents override the shared priority defaults.
   const priority = event.priority
   const moved = event.tags?.includes("Moved") ?? false
-  const ruleColor = priority ? RULE[priority] : undefined
+  const ruleColor = customAccent(event.color) ?? (priority ? RULE[priority] : undefined)
   const priorityStyle: React.CSSProperties | undefined = priority
-    ? { backgroundColor: FILL[priority], borderLeft: `3px ${moved ? "dashed" : "solid"} ${RULE[priority]}` }
+    ? { backgroundColor: customAccent(event.color) ? `color-mix(in srgb, ${ruleColor} 12%, transparent)` : FILL[priority], borderLeft: `3px ${moved ? "dashed" : "solid"} ${ruleColor}` }
     : undefined
   const bgClass = priority ? undefined : colorClasses.bg
   const textClass = priority ? "text-fg" : "text-white"
@@ -1021,14 +1043,14 @@ function EventCard({
           )}
         >
           {kindGlyph(10)}
-          <span className="truncate">{event.title}</span>
+          <span className={cn("truncate", event.completed && "line-through opacity-60")}>{event.title}</span>
         </div>
         {isHovered && (
           <div className="absolute left-0 top-full z-50 mt-1 w-64 animate-in fade-in slide-in-from-top-2 duration-200">
             <Card className="border-2 p-3 shadow-xl bg-white text-fg">
               <div className="space-y-2">
                 <div className="flex items-start justify-between gap-2">
-                  <h4 className="font-semibold text-sm leading-tight text-fg">{event.title}</h4>
+                  <h4 className={cn("font-semibold text-sm leading-tight text-fg", event.completed && "line-through opacity-60")}>{event.title}</h4>
                   {dot("h-3 w-3")}
                 </div>
                 {event.description && <p className="text-xs text-muted-foreground line-clamp-2">{event.description}</p>}
@@ -1079,7 +1101,7 @@ function EventCard({
       >
         <div className="flex items-center gap-1.5 font-semibold">
           {kindGlyph(14)}
-          {event.title}
+          <span className={cn(event.completed && "line-through opacity-60")}>{event.title}</span>
         </div>
         {event.description && (
           <div className={cn("mt-1 text-sm line-clamp-2", priority ? "text-fg-muted" : "opacity-90")}>
@@ -1129,14 +1151,14 @@ function EventCard({
         )}
       >
         {kindGlyph(12)}
-        <div className="truncate">{event.title}</div>
+        <div className={cn("truncate", event.completed && "line-through opacity-60")}>{event.title}</div>
       </div>
       {isHovered && (
         <div className="absolute left-0 top-full z-50 mt-1 w-72 animate-in fade-in slide-in-from-top-2 duration-200">
           <Card className="border-2 p-4 shadow-xl bg-white text-fg animate-in fade-in duration-100">
             <div className="space-y-3">
               <div className="flex items-start justify-between gap-2">
-                <h4 className="font-semibold leading-tight text-fg">{event.title}</h4>
+                <h4 className={cn("font-semibold leading-tight text-fg", event.completed && "line-through opacity-60")}>{event.title}</h4>
                 {dot("h-4 w-4")}
               </div>
               {event.description && <p className="text-sm text-muted-foreground">{event.description}</p>}
@@ -1172,6 +1194,7 @@ function EventCard({
 // Month View Component
 function MonthView({
   currentDate,
+  onDayClick,
   events,
   onEventClick,
   onDragStart,
@@ -1180,6 +1203,7 @@ function MonthView({
   getColorClasses,
 }: {
   currentDate: Date
+  onDayClick?: (date: Date) => void
   events: Event[]
   onEventClick: (event: Event) => void
   onDragStart: (event: Event) => void
@@ -1233,19 +1257,26 @@ function MonthView({
               className={cn(
                 "min-h-20 border-b border-r p-1 transition-colors last:border-r-0 sm:min-h-24 sm:p-2",
                 !isCurrentMonth && "bg-muted/30",
-                "hover:bg-accent/50",
+                onDayClick && "cursor-pointer hover:bg-accent/50",
               )}
+              onClick={(event) => {
+                if (!(event.target as HTMLElement).closest("button, [draggable]")) onDayClick?.(day)
+              }}
               onDragOver={(e) => e.preventDefault()}
               onDrop={() => onDrop(day)}
             >
-              <div
+              <button
+                type="button"
+                onClick={() => onDayClick?.(day)}
+                aria-label={`View ${day.toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric", year: "numeric" })} in Time`}
                 className={cn(
                   "mb-1 flex h-5 w-5 items-center justify-center rounded-full text-xs sm:h-6 sm:w-6 sm:text-sm",
                   isToday && "bg-primary text-primary-foreground font-semibold",
+                  onDayClick && "hover:ring-2 hover:ring-primary/20 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary",
                 )}
               >
                 {day.getDate()}
-              </div>
+              </button>
               <div className="space-y-1">
                 {dayEvents.slice(0, 3).map((event) => (
                   <EventCard
@@ -1273,6 +1304,7 @@ function MonthView({
 // Week View Component
 function WeekView({
   currentDate,
+  onDayClick,
   events,
   onEventClick,
   onDragStart,
@@ -1281,6 +1313,7 @@ function WeekView({
   getColorClasses,
 }: {
   currentDate: Date
+  onDayClick?: (date: Date) => void
   events: Event[]
   onEventClick: (event: Event) => void
   onDragStart: (event: Event) => void
@@ -1317,16 +1350,19 @@ function WeekView({
       <div className="grid grid-cols-8 border-b">
         <div className="border-r p-2 text-center text-xs font-medium sm:text-sm">Time</div>
         {weekDays.map((day) => (
-          <div
+          <button
+            type="button"
             key={day.toISOString()}
-            className="border-r p-2 text-center text-xs font-medium last:border-r-0 sm:text-sm"
+            onClick={() => onDayClick?.(day)}
+            aria-label={`View ${day.toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric", year: "numeric" })} in Time`}
+            className="border-r p-2 text-center text-xs font-medium transition-colors hover:bg-accent/50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary last:border-r-0 sm:text-sm"
           >
             <div className="hidden sm:block">{day.toLocaleDateString("en-US", { weekday: "short" })}</div>
             <div className="sm:hidden">{day.toLocaleDateString("en-US", { weekday: "narrow" })}</div>
             <div className="text-[10px] text-muted-foreground sm:text-xs">
               {day.toLocaleDateString("en-US", { month: "short", day: "numeric" })}
             </div>
-          </div>
+          </button>
         ))}
       </div>
       <div className="grid grid-cols-8">
@@ -1478,7 +1514,7 @@ function ListView({
             <div className="space-y-2">
               {dateEvents.map((event) => {
                 const colorClasses = getColorClasses(event.color)
-                const ruleColor = event.priority ? RULE[event.priority] : undefined
+                const ruleColor = customAccent(event.color) ?? (event.priority ? RULE[event.priority] : undefined)
                 return (
                   <div
                     key={event.id}
@@ -1499,7 +1535,7 @@ function ListView({
                                   <Glyph kind={event.kind} size={13} />
                                 </span>
                               )}
-                              <span className="truncate">{event.title}</span>
+                              <span className={cn("truncate", event.completed && "line-through opacity-60")}>{event.title}</span>
                             </h4>
                             {event.description && (
                               <p className="mt-1 text-xs text-muted-foreground sm:text-sm line-clamp-2">

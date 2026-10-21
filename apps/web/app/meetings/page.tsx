@@ -14,7 +14,7 @@ import {
   type Intent,
   type Priority,
 } from "@/app/lib/api";
-import { Plus, Trash2, AlertTriangle, Video } from "lucide-react";
+import { Plus, Trash2, AlertTriangle, Video, CheckCircle, Circle } from "lucide-react";
 
 interface BusyRow {
   start: string;
@@ -253,8 +253,9 @@ export default function Meetings() {
                     <Glyph kind={meeting.kind} size={18} />
                   </span>
                   <div className="min-w-0 flex-1">
-                    <div className="truncate text-[15px] font-semibold text-fg">{meeting.title}</div>
+                    <div className={`truncate text-[15px] font-semibold text-fg ${meeting.completed_at ? "line-through opacity-60" : ""}`}>{meeting.title}</div>
                     <div className="tabular mt-1 text-[12.5px] font-medium text-fg-muted">
+                      {meeting.completed_at && <span className="font-semibold text-accent">Done · </span>}
                       {formatDuration(meeting.minutes_per_period)} ·{" "}
                       {ranges > 0 ? `${ranges} attendee range${ranges === 1 ? "" : "s"} avoided` : "no attendee ranges"}
                     </div>
@@ -270,6 +271,25 @@ export default function Meetings() {
                       </a>
                     )}
                   </div>
+                  {meeting.period_days == null && (
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        try {
+                          if (meeting.completed_at) await api.uncomplete(meeting.id);
+                          else await api.complete(meeting.id);
+                          await load();
+                        } catch (caught) {
+                          setError(caught instanceof Error ? caught.message : "Could not update completion.");
+                        }
+                      }}
+                      aria-label={`${meeting.completed_at ? "Mark not done" : "Mark done"}: ${meeting.title}`}
+                      aria-pressed={Boolean(meeting.completed_at)}
+                      className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-fg-subtle hover:bg-sunk hover:text-accent"
+                    >
+                      {meeting.completed_at ? <CheckCircle size={19} className="text-accent" /> : <Circle size={19} />}
+                    </button>
+                  )}
                   <button
                     type="button"
                     onClick={async () => {

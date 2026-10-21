@@ -10,6 +10,8 @@ export type Priority = 1 | 2 | 3 | 4;
 export type EnergyLevel = "high" | "medium" | "low";
 
 export interface Block {
+  color?: string | null;
+  tags?: string[];
   intent_id: string;
   title: string;
   kind: IntentKind;
@@ -20,13 +22,40 @@ export interface Block {
   start: string;
   end: string;
   moved_from: string | null;
+  deadline?: string | null;
+  late_by_minutes?: number;
+  completed: boolean;
+  recurring: boolean;
 }
 
 export interface Unmet {
   intent_id: string;
   title: string;
   priority: Priority;
+  occurrence: number;
   shortfall_minutes: number;
+}
+
+export function unmetCalendarConflict(plan: Plan, intent: Intent, unmet: Unmet): { day: string; label: string } | null {
+  if (intent.period_days !== 7 || intent.max_per_day !== 1 || !intent.allowed_weekdays?.length ||
+      intent.min_chunk_minutes !== intent.max_chunk_minutes ||
+      intent.minutes_per_period !== intent.min_chunk_minutes * intent.allowed_weekdays.length) return null;
+  const origin = plan.origin.slice(0, 10);
+  const year = Number(origin.slice(0, 4));
+  const month = Number(origin.slice(5, 7));
+  const date = Number(origin.slice(8, 10));
+  for (let offset = unmet.occurrence * 7; offset < (unmet.occurrence + 1) * 7; offset++) {
+    const candidate = new Date(Date.UTC(year, month - 1, date + offset));
+    const day = candidate.toISOString().slice(0, 10);
+    const weekday = (candidate.getUTCDay() + 6) % 7;
+    if (!intent.allowed_weekdays.includes(weekday) ||
+        intent.skipped_dates?.includes(day) ||
+        plan.blocks.some((block) => block.intent_id === intent.id && block.occurrence === unmet.occurrence && block.start.slice(0, 10) === day)) continue;
+    const conflict = plan.busy.find((event) => event.start.slice(0, 10) <= day && event.end.slice(0, 10) > day &&
+      event.start.slice(11, 16) === "00:00" && event.end.slice(11, 16) === "00:00");
+    if (conflict) return { day, label: conflict.label || "A full-day calendar event" };
+  }
+  return null;
 }
 
 export interface Busy {
@@ -60,6 +89,7 @@ export interface Intent {
   energy?: EnergyLevel | null;
   minutes_per_period: number;
   period_days: number | null;
+  allowed_weekdays?: number[] | null;
   min_chunk_minutes: number;
   max_chunk_minutes: number;
   max_per_day?: number | null;
@@ -69,6 +99,9 @@ export interface Intent {
   preferred_start_min?: number | null;
   /** Set once, on a one-shot task only - see `complete`/`uncomplete` below. */
   completed_at?: string | null;
+  completed_dates?: string[];
+  skipped_dates?: string[];
+  subtasks?: Subtask[];
   /** Slot ranges (not clock times) other attendees are busy - present only
    *  on meeting-kind intents. Its length is the useful part for display. */
   blocked_slots?: [number, number][];
@@ -77,36 +110,21 @@ export interface Intent {
   zoom_join_url?: string | null;
 }
 
-export const SLOT_MINUTES = 15;
-
-function slotToISO(slot: number, origin: string): string {
-  return new Date(Date.parse(origin) + slot * SLOT_MINUTES * 60000).toISOString();
+export interface Subtask {
+  id: string;
+  title: string;
+  for_date?: string | null;
+  completed_at?: string | null;
+  completed_dates?: string[];
 }
 
-/** Rebuilds a full `PUT /api/intents/{id}` body from a stored `Intent`, so an
- *  edit that only changes (say) duration doesn't silently drop the window,
- *  due date or chunk shape the intent already had - the API replaces the
- *  whole object, it does not merge. Not lossless for a Smart Meeting's
- *  attendee constraints: `blocked_slots` carries no attendee names, only the
- *  slot spans, so there is nothing to reconstruct `attendee_busy` from - the
- *  edit UI does not offer editing meetings for exactly this reason. */
-export function intentToEditPayload(intent: Intent, origin: string): Record<string, unknown> {
-  const window = intent.daily_windows?.[0];
+export function subtaskProgress(intent: Intent, day: string): { done: number; total: number } {
+  const items = (intent.subtasks ?? []).filter((item) => !item.for_date || item.for_date === day);
   return {
-    title: intent.title,
-    kind: intent.kind,
-    priority: intent.priority,
-    energy: intent.energy ?? undefined,
-    minutes_per_period: intent.minutes_per_period,
-    period_days: intent.period_days ?? undefined,
-    min_chunk_minutes: intent.min_chunk_minutes,
-    max_chunk_minutes: intent.max_chunk_minutes,
-    max_per_day: intent.max_per_day ?? undefined,
-    window_start_min: window?.start_min,
-    window_end_min: window?.end_min,
-    due: intent.due_slot != null ? slotToISO(intent.due_slot, origin) : undefined,
-    earliest: intent.earliest_slot != null ? slotToISO(intent.earliest_slot, origin) : undefined,
-    preferred_start_min: intent.preferred_start_min ?? undefined,
+    done: items.filter((item) => intent.period_days == null
+      ? Boolean(item.completed_at)
+      : (item.completed_dates ?? []).includes(day)).length,
+    total: items.length,
   };
 }
 
@@ -136,10 +154,26 @@ export const api = {
   intents: () => request<Intent[]>("/api/intents"),
   remove: (id: string) => request<void>(`/api/intents/${id}`, { method: "DELETE" }),
   update: (id: string, body: Record<string, unknown>) =>
-    request<Intent>(`/api/intents/${id}`, { method: "PUT", body: JSON.stringify(body) }),
+    request<Intent>(`/api/intents/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
   complete: (id: string) => request<Intent>(`/api/intents/${id}/complete`, { method: "POST" }),
   uncomplete: (id: string) =>
     request<Intent>(`/api/intents/${id}/complete`, { method: "DELETE" }),
+  completeSession: (id: string, day: string) =>
+    request<Intent>(`/api/intents/${id}/completed-dates/${day}`, { method: "PUT" }),
+  uncompleteSession: (id: string, day: string) =>
+    request<Intent>(`/api/intents/${id}/completed-dates/${day}`, { method: "DELETE" }),
+  addSubtask: (id: string, title: string, day?: string) =>
+    request<Intent>(`/api/intents/${id}/subtasks${day ? `?day=${day}` : ""}`, {
+      method: "POST", body: JSON.stringify({ title }),
+    }),
+  setSubtaskComplete: (id: string, subtaskId: string, complete: boolean, day?: string) =>
+    request<Intent>(`/api/intents/${id}/subtasks/${subtaskId}/complete${day ? `?day=${day}` : ""}`, {
+      method: complete ? "PUT" : "DELETE",
+    }),
+  removeSubtask: (id: string, subtaskId: string) =>
+    request<Intent>(`/api/intents/${id}/subtasks/${subtaskId}`, { method: "DELETE" }),
+  skipSession: (id: string, day: string) =>
+    request<{ task: Intent; plan: Plan }>(`/api/intents/${id}/skips/${day}`, { method: "POST" }),
   capture: (text: string, provider?: string, model?: string, apiKey?: string) =>
     request<{ intent: Intent }>("/api/capture", {
       method: "POST",
@@ -152,8 +186,22 @@ export const api = {
     }),
 };
 
+export async function toggleBlockCompletion(block: Block): Promise<void> {
+  if (block.recurring) {
+    const day = block.start.slice(0, 10);
+    if (block.completed) await api.uncompleteSession(block.intent_id, day);
+    else await api.completeSession(block.intent_id, day);
+  } else if (!block.completed) {
+    await api.complete(block.intent_id);
+  }
+}
+
 export function minutesBetween(start: string, end: string): number {
   return Math.round((Date.parse(end) - Date.parse(start)) / 60000);
+}
+
+export function localDateKey(date: Date = new Date()): string {
+  return [date.getFullYear(), String(date.getMonth() + 1).padStart(2, "0"), String(date.getDate()).padStart(2, "0")].join("-");
 }
 
 export function formatDuration(minutes: number): string {

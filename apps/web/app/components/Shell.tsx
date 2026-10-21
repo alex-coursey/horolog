@@ -9,6 +9,7 @@ import {
   Clock,
   Inbox,
   RotateCcw,
+  RefreshCw,
   Users,
   BarChart3,
   Link2,
@@ -136,6 +137,15 @@ export function Shell({
           </kbd>
         </button>
 
+        <button
+          type="button"
+          onClick={() => window.location.reload()}
+          className="mt-2 flex h-9 items-center gap-2.5 rounded-lg px-3 text-[13px] font-medium text-muted-foreground transition-colors hover:bg-secondary/50 hover:text-foreground focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-foreground"
+        >
+          <RefreshCw size={15} aria-hidden="true" />
+          Refresh page
+        </button>
+
         {/* Live SSE Plan Status Indicator */}
         <div className="mt-auto flex items-center justify-between rounded-xl border border-border bg-secondary/30 px-3 py-2.5">
           <div className="flex items-center gap-2">
@@ -193,7 +203,19 @@ export function Shell({
         })}
       </div>
 
-      <main id="main" className="flex-1 pb-20 lg:pb-0">{children}</main>
+      <main id="main" className="min-w-0 flex-1 pb-20 lg:pb-0">
+        <div className="flex justify-end border-b border-border px-5 py-1.5 lg:hidden">
+          <button
+            type="button"
+            onClick={() => window.location.reload()}
+            className="flex h-8 items-center gap-2 rounded-lg px-2 text-[12px] font-medium text-muted-foreground transition-colors hover:bg-secondary/50 hover:text-foreground focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-foreground"
+          >
+            <RefreshCw size={14} aria-hidden="true" />
+            Refresh
+          </button>
+        </div>
+        {children}
+      </main>
       <CommandBar 
         open={commandOpen} 
         onClose={() => setCommandOpen(false)} 
